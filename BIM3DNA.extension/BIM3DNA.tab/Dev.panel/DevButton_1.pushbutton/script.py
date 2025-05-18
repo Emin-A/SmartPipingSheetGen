@@ -379,6 +379,9 @@ class ElementEditorForm(Form):
         self.colCategory.HeaderText = "Category"
         self.colCategory.ReadOnly = True
 
+        self.category_headers = {}
+        self.collapsed_categories = set()
+
         self.colName = DataGridViewTextBoxColumn()
         self.colName.Name = "Name"
         self.colName.HeaderText = "Name"
@@ -453,6 +456,12 @@ class ElementEditorForm(Form):
         self.btnAutoFill.Click += self.autoFillPipeTagCodes
         self.buttonPanel.Controls.Add(self.btnAutoFill)
 
+        self.btnBulkTags = Button()
+        self.btnBulkTags.Text = "Add/Remove Tags"
+        self.btnBulkTags.Width = 150
+        self.btnBulkTags.Click += self.bulkAddRemoveTags_Click
+        self.buttonPanel.Controls.Add(self.btnBulkTags)
+
         self.btnOK = Button()
         self.btnOK.Text = "OK"
         self.btnOK.Width = 80
@@ -517,6 +526,102 @@ class ElementEditorForm(Form):
                 row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
             elif cat == "Text Notes":
                 row.DefaultCellStyle.BackColor = Color.LightGray
+
+    def bulkAddRemoveTags_Click(self, sender, event):
+        rows_to_process = []
+        for row in self.dataGrid.Rows:
+            cat = row.Cells["Category"].Value
+            if cat == "Pipes":
+                rows_to_process.append(row)
+
+        for row in rows_to_process:
+            val = row.Cells["TagStatus"].Value
+            host_id = int(str(row.Cells["Id"].Value))
+            host = doc.GetElement(ElementId(host_id))
+
+            if val == "Add/Place Tag":
+                tr = Transaction(doc, "Add Tag")
+                tr.Start()
+                bb = host.get_BoundingBox(uidoc.ActiveView)
+                if bb:
+                    ctr = XYZ(
+                        (bb.Min.X + bb.Max.X) / 2.0,
+                        (bb.Min.Y + bb.Max.Y) / 2.0,
+                        (bb.Min.Z + bb.Max.Z) / 2.0,
+                    )
+                    ref = Reference(host)
+                    new_tag = IndependentTag.Create(
+                        doc,
+                        doc.ActiveView.Id,
+                        ref,
+                        True,
+                        TagMode.TM_ADDBY_CATEGORY,
+                        TagOrientation.Horizontal,
+                        ctr,
+                    )
+                tr.Commit()
+                row.Cells["TagStatus"].Value = "Remove Tag"
+                te = doc.GetElement(new_tag.Id)
+                if te:
+                    data = {
+                        "Id": str(te.Id),
+                        "Category": "Pipe Tags",
+                        "Name": te.Name or "",
+                        "DefaultCode": host.LookupParameter("Comments").AsString()
+                        or "",
+                        "NewCode": row.Cells["NewCode"].Value,
+                        "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
+                        "Length": row.Cells["Length"].Value,
+                        "Size": "",
+                        "GEB_Article_Number": "",
+                        "TagStatus": "Yes",
+                    }
+                    self._add_row(data)
+
+            elif val == "Remove Tag":
+                host_eid = host.Id.IntegerValue
+                deleted_id = None
+                tag_elem_id = None
+                for t in (
+                    FilteredElementCollector(doc)
+                    .OfCategory(BuiltInCategory.OST_PipeTags)
+                    .WhereElementIsNotElementType()
+                    .ToElements()
+                ):
+                    tagged = (
+                        t.GetTaggedElementIds()
+                        if hasattr(t, "GetTaggedElementIds")
+                        else [t.TaggedElementId]
+                    )
+                    for rid in tagged:
+                        eid = (
+                            rid.HostElementId.IntegerValue
+                            if hasattr(rid, "HostElementId")
+                            else rid.IntegerValue
+                        )
+                        if eid == host_eid:
+                            deleted_id = t.Id.IntegerValue
+                            tag_elem_id = t.Id
+                            break
+                    if deleted_id:
+                        break
+                if deleted_id:
+                    self.dataGrid.SelectionChanged -= self.on_row_selected
+                    tr = Transaction(doc, "Remove Tag")
+                    tr.Start()
+                    doc.Delete(tag_elem_id)
+                    tr.Commit()
+                    row.Cells["TagStatus"].Value = "Add/Place Tag"
+                    row.Cells["TagStatus"].ReadOnly = False
+                    for i in range(self.dataGrid.Rows.Count):
+                        r2 = self.dataGrid.Rows[i]
+                        if (
+                            r2.Cells["Category"].Value == "Pipe Tags"
+                            and int(str(r2.Cells["Id"].Value)) == deleted_id
+                        ):
+                            self.dataGrid.Rows.RemoveAt(i)
+                            break
+                    self.dataGrid.SelectionChanged += self.on_row_selected
 
     # Smart dynamic spacing
     def rearrange_buttons(self, sender, event):
