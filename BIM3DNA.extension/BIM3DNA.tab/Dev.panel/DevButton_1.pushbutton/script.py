@@ -1396,6 +1396,11 @@ for base in {base}:  # e.g. 5.1.1
     section_bb.Max = region_max
     view3d.SetSectionBox(section_bb)
 
+    view3d.IsSectionBoxActive = True
+    section_box = view3d.GetSectionBox()
+    if section_box:
+        section_box.Enabled = True
+
     # 4. position the 3D viewport on the sheet (to the right of the floor plan)
     o = sheet.Outline
     # push it over 1/3 of the sheet width, and up a bit
