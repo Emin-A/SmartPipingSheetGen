@@ -1273,6 +1273,21 @@ if annoParam and not annoParam.IsReadOnly:
 
 new_view.CropBox = bb
 
+# Hide crop region controls (but keep border visible)
+param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
+if param and not param.IsReadOnly:
+    param.Set(0)
+
+# Hide temporary blue dimensions
+# temp_dim_param = new_view.get_Parameter(BuiltInParameter.VIEWER_TEMP_DIM_VISIBLE)
+# if temp_dim_param and not temp_dim_param.IsReadOnly:
+#     temp_dim_param.Set(0)
+
+# Hide pipe drag handles (blue grip boxes)
+cat_drag_controls = doc.Settings.Categories.get_Item(BuiltInCategory.OST_ConnectorElem)
+if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
+    new_view.SetCategoryHidden(cat_drag_controls.Id, True)
+
 tx.Commit()
 # -----------------------------------------
 # 2) SHOW TITLE-BLOCK PICKER, THEN CREATE SHEET
