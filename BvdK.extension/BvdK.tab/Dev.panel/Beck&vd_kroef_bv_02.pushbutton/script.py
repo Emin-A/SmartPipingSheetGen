@@ -64,37 +64,30 @@ doc = __revit__.ActiveUIDocument.Document
 view = doc.ActiveView
 
 
-# Helpers
 def is_pipe_of_type(pipe, name, min_diam_mm):
     return name in pipe.Name and pipe.Diameter * 304.8 >= min_diam_mm
 
 
-def get_pipe_direction(pipe):
+def get_direction_vector(pipe):
     try:
         curve = pipe.Location.Curve
-        vec = curve.GetEndPoint(1) - curve.GetEndPoint(0)
-        return vec.Normalize()
+        return (curve.GetEndPoint(1) - curve.GetEndPoint(0)).Normalize()
     except:
         return None
 
 
-def classify_direction(vec):
-    if vec is None:
-        return "Unknown"
-    angle = math.degrees(math.atan2(vec.Y, vec.X))
-    if -45 <= angle < 45:
-        return "Right"
-    elif 45 <= angle < 135:
-        return "Up"
-    elif angle >= 135 or angle < -135:
-        return "Left"
-    elif -135 <= angle < -45:
-        return "Down"
-    return "Unknown"
+def get_branch_pipe(fitting, main_pipe_id):
+    try:
+        for c in fitting.MEPModel.ConnectorManager.Connectors:
+            for r in c.AllRefs:
+                other = r.Owner
+                if isinstance(other, Pipe) and other.Id != main_pipe_id:
+                    return other
+    except:
+        return None
 
 
 def set_yesno_param(elem, param_name, on=True):
-    # Do not allow disabling 'reducer_eccentric'
     if param_name == "reducer_eccentric" and not on:
         return
     p = elem.LookupParameter(param_name)
@@ -105,16 +98,29 @@ def set_yesno_param(elem, param_name, on=True):
             pass
 
 
-def get_connected_pipe_direction(fitting, main_pipe):
+def vectors_are_aligned(vec1, vec2):
+    if vec1 is None or vec2 is None:
+        return False
+    dot = vec1.Normalize().DotProduct(vec2.Normalize())
+    return dot >= 0.5  # ~60 degrees or less difference
+
+
+def try_update_fitting(fitting, param_map, flip=False):
+    t = Transaction(doc, "Update Fitting")
+    t.Start()
     try:
-        for c in fitting.MEPModel.ConnectorManager.Connectors:
-            for r in c.AllRefs:
-                other = r.Owner
-                if isinstance(other, Pipe) and other.Id != main_pipe.Id:
-                    return get_pipe_direction(other)
+        for name in param_map:
+            set_yesno_param(fitting, name, param_map[name])
+        try:
+            if flip and hasattr(fitting, "CanFlipHand") and fitting.CanFlipHand:
+                fitting.FlipHand()
+        except:
+            pass
+        t.Commit()
+        return True
     except:
-        pass
-    return None
+        t.RollBack()
+        return False
 
 
 def is_reducer_fully_connected(fitting):
@@ -128,23 +134,7 @@ def is_reducer_fully_connected(fitting):
         return False
 
 
-def try_update_fitting(elem_id, param_map):
-    fitting = doc.GetElement(elem_id)
-    if fitting is None:
-        return False
-    t = Transaction(doc, "Update Fitting")
-    t.Start()
-    try:
-        for name in param_map:
-            set_yesno_param(fitting, name, param_map[name])
-        t.Commit()
-        return True
-    except:
-        t.RollBack()
-        return False
-
-
-# === Core Logic ===
+# === CORE FUNCTION ===
 
 
 def auto_fix():
@@ -157,10 +147,11 @@ def auto_fix():
     tg = TransactionGroup(doc, "Safe Reducer Update")
     tg.Start()
 
-    # --- Process T-stuks ---
     for pipe in pipes:
         if not is_pipe_of_type(pipe, "NLRS_52_PI_PE buis", 160):
             continue
+
+        main_dir = get_direction_vector(pipe)
 
         for conn in pipe.ConnectorManager.Connectors:
             for ref in conn.AllRefs:
@@ -168,69 +159,88 @@ def auto_fix():
                 if other_id.IntegerValue in visited:
                     continue
                 visited.add(other_id.IntegerValue)
-
-                other = doc.GetElement(other_id)
-                if other is None or not isinstance(other, FamilyInstance):
+                try:
+                    other = doc.GetElement(other_id)
+                    if other is None or not other.IsValidObject:
+                        continue
+                    if not isinstance(other, FamilyInstance):
+                        continue
+                    # Access symbol only if still valid
+                    symbol = other.Symbol
+                    if symbol is None or not symbol.IsValidObject:
+                        continue
+                    family = symbol.Family
+                    if family is None or not family.IsValidObject:
+                        continue
+                    family_name = family.Name
+                    if not family_name:
+                        continue
+                except:
                     continue
-                if not other.Symbol.Family.Name.startswith(
-                    "NLRS_52_PIF_UN_PE multi T-stuk"
-                ):
+                if not family_name.startswith("NLRS_52_PIF_UN_PE multi T-stuk"):
                     continue
 
-                dir_vec = get_connected_pipe_direction(other, pipe)
-                dir_label = classify_direction(dir_vec)
+                branch_pipe = get_branch_pipe(other, pipe.Id)
+                branch_dir = get_direction_vector(branch_pipe)
+
+                aligned = vectors_are_aligned(main_dir, branch_dir)
 
                 param_map = {
                     "kort_verloop (kleinste)": True,
                     "kort_verloop (grootste)": True,
                     "reducer_eccentric": True,
-                    "switch_excentriciteit": dir_label in ["Right", "Down"],
+                    "switch_excentriciteit": not aligned,  # ON if opposite to main flow
                 }
 
-                if try_update_fitting(other.Id, param_map):
-                    print("\u2705 Matched T-stuk:", other.Id, "\u2192", dir_label)
+                if try_update_fitting(other, param_map, flip=True):
                     updated += 1
                 else:
-                    print("⚠️ Skipped T-stuk (not editable):", other.Id)
                     skipped += 1
 
-    # --- Process elbows and reducers last ---
+    # Elbows and reducers
     for f in fittings:
         try:
-            f_id = f.Id
-            f_valid = doc.GetElement(f_id)
-            if f_valid is None:
+            if f is None or not f.IsValidObject:
                 continue
-            name = f_valid.Symbol.Family.Name.lower()
-
-            if "multibocht" in name:
-                param_map = {"2x45°": False, "buis_invogen": False}
-                if try_update_fitting(f_id, param_map):
-                    updated += 1
-                else:
-                    skipped += 1
-
-            elif "multireducer" in name:
-                if is_reducer_fully_connected(f_valid):
-                    skipped += 1
-                    continue  # ✅ Skip fully connected reducers
-                param_map = {
-                    "kort_verloop (kleinste)": False,
-                    "kort_verloop (grootste)": False,
-                    "switch_excentriciteit": False,
-                    "reducer_eccentric": False,  # Safe override (won’t be turned off)
-                }
-                if try_update_fitting(f_id, param_map):
-                    updated += 1
-                else:
-                    skipped += 1
-        except Exception as e:
-            print("⚠️ Skipped invalid fitting:", str(e))
-            skipped += 1
+            symbol = f.Symbol
+            if symbol is None or not symbol.IsValidObject:
+                continue
+            family = symbol.Family
+            if family is None or not family.IsValidObject:
+                continue
+            name = family.Name.lower()
+        except:
             continue
+
+        if "multibocht" in name:
+            param_map = {"2x45°": False, "buis_invogen": False}
+            if try_update_fitting(f, param_map):
+                updated += 1
+            else:
+                skipped += 1
+
+        elif "multireducer" in name:
+            try:
+                if f is None or not f.IsValidObject or is_reducer_fully_connected(f):
+                    skipped += 1
+                    continue
+            except:
+                skipped += 1
+                continue
+            param_map = {
+                "kort_verloop (kleinste)": False,
+                "kort_verloop (grootste)": False,
+                "switch_excentriciteit": False,
+                "reducer_eccentric": False,
+            }
+            if try_update_fitting(f, param_map):
+                updated += 1
+            else:
+                skipped += 1
+
     tg.Assimilate()
     MessageBox.Show(
-        "✅ Finished.\nUpdated: " + str(updated) + "\nSkipped: " + str(skipped),
+        "✅ Finished\nUpdated: " + str(updated) + "\nSkipped: " + str(skipped),
         "AutoFix Reducers",
     )
 
