@@ -30,12 +30,18 @@ Author: Emin Avdovic"""
 # ==================================================
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB import (
-    FamilySymbol,
-    FilteredElementCollector,
-    FormatOptions,
     BuiltInCategory,
     BuiltInParameter,
     ElementId,
+    FamilySymbol,
+    FamilyInstance,
+    FilteredElementCollector,
+    FormatOptions,
+    FilterStringRule,
+    FilterStringRuleEvaluator,
+    FilterStringBeginsWith,
+    FilterStringContains,
+    FilterStringEquals,
     XYZ,
     Transaction,
     TextNote,
@@ -53,22 +59,19 @@ from Autodesk.Revit.DB import (
     ViewDiscipline,
     Viewport,
     ParameterValueProvider,
-    FilterStringRule,
-    FilterStringRuleEvaluator,
-    FilterStringBeginsWith,
-    FilterStringContains,
-    FilterStringEquals,
     ParameterFilterElement,
     ScheduleSheetInstance,
     ScheduleFilter,
     ScheduleFilterType,
     ScheduleSortGroupField,
     ScheduleSortOrder,
+    StorageType,
     SectionType,
     Category,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.UI import *
+from Autodesk.Revit.UI import TaskDialog
 from Autodesk.Revit.UI import UIDocument
 from Autodesk.Revit.DB.Structure import *
 from Autodesk.Revit.Exceptions import *
@@ -114,6 +117,7 @@ from System.Windows.Forms import (
 from System.Drawing import Image, Point, Color, Rectangle, Size
 from System.IO import MemoryStream
 from System.Windows.Forms import DataGridViewButtonColumn
+
 from System import Array
 import math, re, sys
 
@@ -342,7 +346,7 @@ def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
 class ElementEditorForm(Form):
     def __init__(self, elements_data, region_elements=None):
         self.Text = "Edit Element Codes"
-        self.Width = 950
+        self.Width = 1050
         self.Height = 500
         self.MinimumSize = Size(700, 400)
         self.SuspendLayout()
@@ -387,6 +391,16 @@ class ElementEditorForm(Form):
         self.colName.HeaderText = "Name"
         self.colName.ReadOnly = True
 
+        self.colWarning = DataGridViewTextBoxColumn()
+        self.colWarning.Name = "Warning"
+        self.colWarning.HeaderText = "Warning"
+        self.colWarning.ReadOnly = True
+
+        self.colBend45 = DataGridViewTextBoxColumn()
+        self.colBend45.Name = "Bend45"
+        self.colBend45.HeaderText = "2x45°"
+        self.colBend45.ReadOnly = True
+
         self.colDefaultCode = DataGridViewTextBoxColumn()
         self.colDefaultCode.Name = "DefaultCode"
         self.colDefaultCode.HeaderText = "Default Code"
@@ -428,6 +442,8 @@ class ElementEditorForm(Form):
                     self.colId,
                     self.colCategory,
                     self.colName,
+                    self.colWarning,
+                    self.colBend45,
                     self.colDefaultCode,
                     self.colNewCode,
                     self.colOD,
@@ -454,6 +470,12 @@ class ElementEditorForm(Form):
         self.btnPlaceTextNote.Width = 150
         self.btnPlaceTextNote.Click += self.btnPlaceTextNote_Click
         self.buttonPanel.Controls.Add(self.btnPlaceTextNote)
+
+        self.btnFixReducers = Button()
+        self.btnFixReducers.Text = "Fix Reducers"
+        self.btnFixReducers.Width = 150
+        self.btnFixReducers.Click += self.btnFixReducers_Click
+        self.buttonPanel.Controls.Add(self.btnFixReducers)
 
         self.btnBulkTags = Button()
         self.btnBulkTags.Text = "Add/Remove Tags"
@@ -500,6 +522,8 @@ class ElementEditorForm(Form):
             row.Cells["Id"].Value = ed["Id"]
             row.Cells["Category"].Value = ed["Category"]
             row.Cells["Name"].Value = ed["Name"]
+            row.Cells["Warning"].Value = ed.get("Warning", "")
+            row.Cells["Bend45"].Value = ed.get("Bend45", "")
             row.Cells["GEB_Article_Number"].Value = ed.get("GEB_Article_Number", "")
             row.Cells["DefaultCode"].Value = ed["DefaultCode"]
             row.Cells["NewCode"].Value = ed["NewCode"]
@@ -531,6 +555,84 @@ class ElementEditorForm(Form):
                 row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
             elif cat == "Text Notes":
                 row.DefaultCellStyle.BackColor = Color.LightGray
+
+    def auto_fix_inline(self):
+        updated = 0
+        skipped = 0
+
+        for row in self.dataGrid.Rows:
+            try:
+                cat = row.Cells["Category"].Value
+                if cat != "Pipe Fittings":
+                    continue
+
+                eid = int(str(row.Cells["Id"].Value))
+                elem = doc.GetElement(ElementId(eid))
+                if not elem or not elem.IsValidObject:
+                    continue
+
+                name = elem.Name
+                print("Checking:", elem.Id, "| Name:", name)
+
+                p_warn = elem.LookupParameter("waarschuwing")
+                warning = p_warn.AsString() if p_warn else ""
+                print(" -> Warning:", warning)
+
+                if not warning or "concentric" not in warning.lower():
+                    skipped += 1
+                    continue
+
+                param_map = {
+                    "kort_verloop (kleinste)": True,
+                    "kort_verloop (grootste)": True,
+                    "reducer_eccentric": True,
+                    "switch_excentriciteit": False,
+                }
+                t = Transaction(doc, "Fix Reducer")
+                t.Start()
+                for pname, value in param_map.items():
+                    p = elem.LookupParameter(pname)
+                    if p and p.StorageType == StorageType.Integer:
+                        p.Set(1 if value else 0)
+                t.Commit()
+                updated += 1
+            except Exception as ex:
+                print("Exception while processing:", ex)
+                skipped += 1
+
+        return updated, skipped
+
+    def btnFixReducers_Click(self, sender, event):
+
+        updated, skipped = self.auto_fix_inline()
+
+        for row in self.dataGrid.Rows:
+            cat = row.Cells["Category"].Value
+            if cat != "Pipe Fittings":
+                continue
+
+            try:
+                eid = int(str(row.Cells["Id"].Value))
+                elem = doc.GetElement(ElementId(eid))
+                if not elem:
+                    continue
+
+                # Re-read parameters from Revit
+                p_warn = elem.LookupParameter("waarschuwing")
+                warning_val = p_warn.AsString() if p_warn else ""
+                row.Cells["Warning"].Value = warning_val
+
+                p_bend = elem.LookupParameter("2x45°")
+                if p_bend and p_bend.StorageType == StorageType.Integer:
+                    bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
+                    row.Cells["Bend45"].Value = bend45_val
+            except:
+                continue
+
+        MessageBox.Show(
+            "✅ Reducers Fixed!\n\nUpdated: {}\nSkipped: {}".format(updated, skipped),
+            "Fix Reducers",
+        )
 
     def clear_placeholder(self, sender, event):
         if self.txtTextNoteCode.Text == "prefab 5.5.5":
@@ -990,12 +1092,16 @@ def filter_relevant_elements(gathered_elements):
             if host and host.Id.IntegerValue in pipe_ids:
                 # and only if we haven't already added it in gathered_elements
                 if not any(str(tag.Id) == d["Id"] for d in relevant):
+                    warning_val = ""
+                    bend45_val = ""
                     # build your dict exactly like you do for pipe‑tags below
                     relevant.append(
                         {
                             "Id": str(tag.Id),
                             "Category": "Pipe Tags",
                             "Name": tag.Name or "",
+                            "Warning": "",
+                            "Bend45": "",
                             "DefaultCode": host.LookupParameter("Comments").AsString()
                             or "",
                             "NewCode": host.LookupParameter("Comments").AsString()
@@ -1025,10 +1131,13 @@ def filter_relevant_elements(gathered_elements):
         default_code = com.AsString() if com and com.AsString() else ""
 
         # initialize
+        warning_val = ""
+        bend45_val = ""
         outside_diam = ""
         length_val = ""
         art_num = ""
         tag_status = ""
+        size_val = ""
 
         # --- Pipes ---
         if cat == "Pipes":
@@ -1057,6 +1166,13 @@ def filter_relevant_elements(gathered_elements):
 
         # --- Pipe Fittings ---
         elif cat == "Pipe Fittings":
+            p_warn = e.LookupParameter("waarschuwing")
+            warning_val = p_warn.AsString() if p_warn else ""
+
+            p_bend = e.LookupParameter("2x45°")
+            bend45_val = ""
+            if p_bend and p_bend.StorageType == StorageType.Integer:
+                bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
             # diameter (try several names)
             for pname in ("Outside Diameter", "Diameter", "Nominal Diameter"):
                 p = e.LookupParameter(pname)
@@ -1103,13 +1219,16 @@ def filter_relevant_elements(gathered_elements):
         size_val = ""
         if cat == "Pipe Fittings":
             param_size = e.LookupParameter("Size")
-            size_val = convert_param_to_string(param_size)
+            if param_size:
+                size_val = convert_param_to_string(param_size)
 
         relevant.append(
             {
                 "Id": str(e.Id),
                 "Category": cat,
                 "Name": e.Name if hasattr(e, "Name") else "",
+                "Warning": warning_val,
+                "Bend45": bend45_val,
                 "DefaultCode": default_code,
                 "NewCode": default_code,
                 "OutsideDiameter": outside_diam,

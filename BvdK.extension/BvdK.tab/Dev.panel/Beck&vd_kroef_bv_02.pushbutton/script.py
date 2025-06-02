@@ -88,8 +88,6 @@ def get_branch_pipe(fitting, main_pipe_id):
 
 
 def set_yesno_param(elem, param_name, on=True):
-    if param_name == "reducer_eccentric" and not on:
-        return
     p = elem.LookupParameter(param_name)
     if p and p.StorageType == StorageType.Integer:
         try:
@@ -98,24 +96,14 @@ def set_yesno_param(elem, param_name, on=True):
             pass
 
 
-def vectors_are_aligned(vec1, vec2):
-    if vec1 is None or vec2 is None:
-        return False
-    dot = vec1.Normalize().DotProduct(vec2.Normalize())
-    return dot >= 0.5  # ~60 degrees or less difference
-
-
 def try_update_fitting(fitting, param_map, flip=False):
     t = Transaction(doc, "Update Fitting")
     t.Start()
     try:
         for name in param_map:
             set_yesno_param(fitting, name, param_map[name])
-        try:
-            if flip and hasattr(fitting, "CanFlipHand") and fitting.CanFlipHand:
-                fitting.FlipHand()
-        except:
-            pass
+        if flip and hasattr(fitting, "CanFlipHand") and fitting.CanFlipHand:
+            fitting.FlipHand()
         t.Commit()
         return True
     except:
@@ -134,7 +122,54 @@ def is_reducer_fully_connected(fitting):
         return False
 
 
-# === CORE FUNCTION ===
+def get_branch_connector_direction(fitting):
+    try:
+        connectors = list(fitting.MEPModel.ConnectorManager.Connectors)
+        diameters = [c.Radius for c in connectors]
+        main_diam = max(diameters)
+        for c in connectors:
+            if abs(c.Radius - main_diam) > 0.001:
+                return c.CoordinateSystem.BasisZ
+    except:
+        return None
+
+
+def determine_switch_excentriciteit(dir_main, dir_branch):
+    try:
+        dir_main = dir_main.Normalize()
+        dir_branch = dir_branch.Normalize()
+    except:
+        return None
+
+    dot = dir_main.DotProduct(dir_branch)  # flow direction
+    cross_z = dir_main.CrossProduct(dir_branch).Z
+
+    # Adjust thresholds to be stricter
+    if dot > 0.7:
+        flow_dir = "with"
+    elif dot < -0.7:
+        flow_dir = "against"
+    else:
+        return None  # Skip edge cases (e.g. 90° aligned)
+
+    if cross_z > 0.1:
+        side = "right"
+    elif cross_z < -0.1:
+        side = "left"
+    else:
+        return None  # Ambiguous direction
+
+    # Final logic table
+    if side == "left" and flow_dir == "with":
+        return False
+    elif side == "left" and flow_dir == "against":
+        return True
+    elif side == "right" and flow_dir == "with":
+        return True
+    elif side == "right" and flow_dir == "against":
+        return False
+
+    return None
 
 
 def auto_fix():
@@ -150,7 +185,6 @@ def auto_fix():
     for pipe in pipes:
         if not is_pipe_of_type(pipe, "NLRS_52_PI_PE buis", 160):
             continue
-
         main_dir = get_direction_vector(pipe)
 
         for conn in pipe.ConnectorManager.Connectors:
@@ -159,45 +193,42 @@ def auto_fix():
                 if other_id.IntegerValue in visited:
                     continue
                 visited.add(other_id.IntegerValue)
-                try:
-                    other = doc.GetElement(other_id)
-                    if other is None or not other.IsValidObject:
-                        continue
-                    if not isinstance(other, FamilyInstance):
-                        continue
-                    # Access symbol only if still valid
-                    symbol = other.Symbol
-                    if symbol is None or not symbol.IsValidObject:
-                        continue
-                    family = symbol.Family
-                    if family is None or not family.IsValidObject:
-                        continue
-                    family_name = family.Name
-                    if not family_name:
-                        continue
-                except:
+                other = doc.GetElement(other_id)
+                if other is None or not other.IsValidObject:
                     continue
-                if not family_name.startswith("NLRS_52_PIF_UN_PE multi T-stuk"):
+                if not isinstance(other, FamilyInstance):
+                    continue
+                symbol = other.Symbol
+                if symbol is None or not symbol.IsValidObject:
+                    continue
+                family = symbol.Family
+                if family is None or not family.IsValidObject:
+                    continue
+                family_name = family.Name
+                if not family_name or not family_name.startswith(
+                    "NLRS_52_PIF_UN_PE multi T-stuk"
+                ):
                     continue
 
                 branch_pipe = get_branch_pipe(other, pipe.Id)
                 branch_dir = get_direction_vector(branch_pipe)
-
-                aligned = vectors_are_aligned(main_dir, branch_dir)
+                switch_ex = determine_switch_excentriciteit(main_dir, branch_dir)
 
                 param_map = {
                     "kort_verloop (kleinste)": True,
                     "kort_verloop (grootste)": True,
                     "reducer_eccentric": True,
-                    "switch_excentriciteit": not aligned,  # ON if opposite to main flow
+                    "switch_excentriciteit": switch_ex,
+                    "bend_visible": True,
+                    "bend_visible_preserve": True,
                 }
 
-                if try_update_fitting(other, param_map, flip=True):
+                if try_update_fitting(other, param_map):
                     updated += 1
                 else:
                     skipped += 1
 
-    # Elbows and reducers
+    # Elbows
     for f in fittings:
         try:
             if f is None or not f.IsValidObject:
@@ -220,11 +251,7 @@ def auto_fix():
                 skipped += 1
 
         elif "multireducer" in name:
-            try:
-                if f is None or not f.IsValidObject or is_reducer_fully_connected(f):
-                    skipped += 1
-                    continue
-            except:
+            if is_reducer_fully_connected(f):
                 skipped += 1
                 continue
             param_map = {
