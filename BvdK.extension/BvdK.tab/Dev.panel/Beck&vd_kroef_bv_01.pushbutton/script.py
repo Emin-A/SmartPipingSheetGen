@@ -641,12 +641,108 @@ class ElementEditorForm(Form):
                         p_bend.Set(0)
                         t.Commit()
                         updated += 1
-                    else:
+                    elif not reducer_fixed:
                         print(" -> 2x45° already OFF")
-                        if not reducer_fixed:
-                            skipped += 1
+                        skipped += 1
                 elif not reducer_fixed:
                     skipped += 1
+
+                # Auto toggle 2x45 degree for elbows based on vertical pipe diameter
+                if isinstance(elem, FamilyInstance):
+                    fam_name = elem.Symbol.Family.Name.lower()
+                    if "bocht_sh_geb" in fam_name or "bocht" in fam_name:
+                        connector_mgr = elem.MEPModel.ConnectorManager
+                        vertical_diam = None
+
+                        for conn in connector_mgr.Connectors:
+                            dir = conn.CoordinateSystem.BasisZ
+                            if abs(dir.Z) > 0.9:
+                                try:
+                                    connected = list(conn.AllRefs)
+                                    for ref in connected:
+                                        if ref.Owner.Id != elem.Id and hasattr(
+                                            ref.Owner, "LookupParameter"
+                                        ):
+                                            pipe = ref.Owner
+                                            diam_param = pipe.LookupParameter(
+                                                "Outside Diameter"
+                                            ) or pipe.LookupParameter("Diameter")
+                                            if diam_param:
+                                                d_mm = diam_param.AsDouble() * 304.8
+                                                vertical_diam = d_mm
+                                                break
+                                except Exception as ex:
+                                    print(
+                                        "⚠️ Failed to resolve vertical pipe diameter:",
+                                        ex,
+                                    )
+
+                        if vertical_diam is not None:
+                            try:
+                                bend_param = elem.LookupParameter("2x45°")
+                                if (
+                                    bend_param
+                                    and bend_param.StorageType == StorageType.Integer
+                                ):
+                                    t = Transaction(doc, "Set 2x45° for elbow")
+                                    t.Start()
+                                    if vertical_diam > 100:
+                                        bend_param.Set(1)
+                                        print(
+                                            "✅ 2x45° turned ON for:",
+                                            elem.Id,
+                                            "| Ø =",
+                                            vertical_diam,
+                                        )
+                                    else:
+                                        bend_param.Set(0)
+                                        print(
+                                            "✅ 2x45° turned OFF for:",
+                                            elem.Id,
+                                            "| Ø =",
+                                            vertical_diam,
+                                        )
+                                    t.Commit()
+                                    updated += 1
+                            except Exception as ex:
+                                print("❌ Failed to set 2x45° on elbow:", ex)
+
+                    # Auto toggle reducer_eccentric for multireducer going UP
+                    elif "multireducer_geb" in fam_name:
+                        try:
+                            connector_mgr = elem.MEPModel.ConnectorManager
+                            is_vertical_up = False
+
+                            for conn in connector_mgr.Connectors:
+                                dir = conn.CoordinateSystem.BasisZ
+                                if abs(dir.Z) > 0.9:
+                                    connected = list(conn.AllRefs)
+                                    for ref in connected:
+                                        if ref.Owner.Id != elem.Id:
+                                            # Check if the direction is upward
+                                            vec = conn.CoordinateSystem.BasisZ
+                                            if vec.Z > 0.9:
+                                                is_vertical_up = True
+                                                break
+                                    if is_vertical_up:
+                                        break
+
+                            if is_vertical_up:
+                                reducer_param = elem.LookupParameter(
+                                    "reducer_eccentric"
+                                )
+                                if reducer_param and reducer_param.AsInteger() == 1:
+                                    t = Transaction(doc, "Auto-Fix Reducer Eccentric")
+                                    t.Start()
+                                    reducer_param.Set(0)
+                                    t.Commit()
+                                    print(
+                                        "✅ Turned OFF reducer_eccentric for vertical-up multireducer:",
+                                        elem.Id,
+                                    )
+                                    updated += 1
+                        except Exception as ex:
+                            print("❌ Failed to auto-toggle reducer_eccentric:", ex)
 
             except Exception as ex:
                 print("Exception while processing:", ex)
