@@ -202,7 +202,11 @@ def copy_scope_boxes(source_doc, target_doc, scope_box_ids):
     if not scope_box_ids:
         return {}
     copy_options = CopyPasteOptions()
-    scope_box_ids_list = List[ElementId](list(scope_box_ids))
+    # Correct: convert to .NET List[ElementId]
+    scope_box_ids_list = List[ElementId]()
+    for eid in scope_box_ids:
+        scope_box_ids_list.Add(eid)
+
     with Transaction(target_doc, "Copy Scope Boxes") as t:
         t.Start()
         # CopyElements returns new element ids in the target doc
@@ -211,8 +215,7 @@ def copy_scope_boxes(source_doc, target_doc, scope_box_ids):
         )
         # id_map: Dict[ElementId, ElementId]
         t.Commit()
-    # Map old scopebox id to new one in target doc
-    # Convert ElementIdMap to a Python dict (old_id: new_id)
+    # ElementIdMap -> Python dict:
     id_dict = {}
     it = id_map.ForwardIterator()
     it.Reset()
@@ -238,7 +241,7 @@ def copy_views(source_doc, target_doc, views, scopebox_id_map):
             new_view = target_doc.GetElement(new_view_id)
             view_id_map[v.Id] = new_view_id
             # Assign scope box if applicable
-            if v.ScopeBox and v.ScopeBox.IntegerValue != -1:
+            if hasattr(v, "ScopeBox") and v.ScopeBox and v.ScopeBox.IntegerValue != -1:
                 if v.ScopeBox in scopebox_id_map:
                     new_view.ScopeBox = scopebox_id_map[v.ScopeBox]
             # Copy view template if exists
