@@ -58,6 +58,7 @@ from Autodesk.Revit.DB import (
     StorageType,
     SectionType,
     Category,
+    CurveLoop,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.UI import *
@@ -204,23 +205,24 @@ def copy_scope_boxes(source_doc, target_doc, scope_box_ids):
     copy_options = CopyPasteOptions()
     # Correct: convert to .NET List[ElementId]
     scope_box_ids_list = List[ElementId]()
+    original_ids = []
     for eid in scope_box_ids:
         scope_box_ids_list.Add(eid)
+        original_ids.append(eid)
 
     with Transaction(target_doc, "Copy Scope Boxes") as t:
         t.Start()
         # CopyElements returns new element ids in the target doc
-        id_map = ElementTransformUtils.CopyElements(
+        new_ids = ElementTransformUtils.CopyElements(
             source_doc, scope_box_ids_list, target_doc, None, copy_options
         )
-        # id_map: Dict[ElementId, ElementId]
         t.Commit()
-    # ElementIdMap -> Python dict:
+    new_ids = list(new_ids)
+    if len(new_ids) != len(original_ids):
+        raise Exception("Scope box copy count mismatch.")
     id_dict = {}
-    it = id_map.ForwardIterator()
-    it.Reset()
-    while it.MoveNext():
-        id_dict[it.Key] = it.Value
+    for orig_id, new_id in zip(original_ids, new_ids):
+        id_dict[orig_id] = new_id
     return id_dict
 
 
@@ -230,14 +232,60 @@ def copy_views(source_doc, target_doc, views, scopebox_id_map):
 
     view_id_map = {}
     copy_options = CopyPasteOptions()
-    views_list = List[ElementId]([v.Id for v in views])
+    target_template_lookup = {}
+    for tmpl in FilteredElementCollector(target_doc).OfClass(View):
+        if getattr(tmpl, "IsTemplate", False):
+            key = (tmpl.Name, tmpl.ViewType)
+            if key not in target_template_lookup:
+                target_template_lookup[key] = tmpl.Id
+
+    template_cache = {}
+
+    def resolve_template_id(template_id):
+        if (
+            not template_id
+            or template_id == ElementId.InvalidElementId
+            or template_id.IntegerValue == -1
+        ):
+            return ElementId.InvalidElementId
+        if template_id in template_cache:
+            return template_cache[template_id]
+        template = source_doc.GetElement(template_id)
+        if not template:
+            template_cache[template_id] = ElementId.InvalidElementId
+            return template_cache[template_id]
+        key = (template.Name, template.ViewType)
+        template_cache[template_id] = target_template_lookup.get(
+            key, ElementId.InvalidElementId
+        )
+        return template_cache[template_id]
+
+    primary_views = []
+    dependent_views = []
+    for v in views:
+        primary_id = ElementId.InvalidElementId
+        try:
+            primary_id = v.GetPrimaryViewId()
+        except Exception:
+            pass
+        if primary_id == ElementId.InvalidElementId:
+            primary_views.append(v)
+        else:
+            dependent_views.append(v)
+
+    if not primary_views:
+        raise Exception("No primary views available to copy.")
+
+    views_list = List[ElementId]([v.Id for v in primary_views])
     with Transaction(target_doc, "Copy Views") as t:
         t.Start()
-        id_map = ElementTransformUtils.CopyElements(
+        new_view_ids = ElementTransformUtils.CopyElements(
             source_doc, views_list, target_doc, None, copy_options
         )
-        for i, v in enumerate(views):
-            new_view_id = id_map[v.Id]
+        new_view_ids = list(new_view_ids)
+        if len(new_view_ids) != len(primary_views):
+            raise Exception("View copy count mismatch.")
+        for v, new_view_id in zip(primary_views, new_view_ids):
             new_view = target_doc.GetElement(new_view_id)
             view_id_map[v.Id] = new_view_id
             # Assign scope box if applicable
@@ -245,7 +293,68 @@ def copy_views(source_doc, target_doc, views, scopebox_id_map):
                 if v.ScopeBox in scopebox_id_map:
                     new_view.ScopeBox = scopebox_id_map[v.ScopeBox]
             # Copy view template if exists
-            new_view.ViewTemplateId = v.ViewTemplateId
+            resolved_template = resolve_template_id(v.ViewTemplateId)
+            if resolved_template != ElementId.InvalidElementId:
+                new_view.ViewTemplateId = resolved_template
+
+        # Recreate dependent views by duplicating the copied primary view
+        for dep_view in dependent_views:
+            parent_id = dep_view.GetPrimaryViewId()
+            if parent_id not in view_id_map:
+                raise Exception(
+                    "Primary view for '{}' was not copied; cannot recreate dependent.".format(
+                        dep_view.Name
+                    )
+                )
+            new_parent = target_doc.GetElement(view_id_map[parent_id])
+            new_dep_id = new_parent.Duplicate(ViewDuplicateOption.AsDependent)
+            new_dep = target_doc.GetElement(new_dep_id)
+
+            # Apply metadata to the duplicated dependent view
+            try:
+                new_dep.Name = dep_view.Name
+            except Exception:
+                suffix = 1
+                base_name = dep_view.Name
+                while True:
+                    try:
+                        new_dep.Name = "{}_copy{}".format(base_name, suffix)
+                        break
+                    except Exception:
+                        suffix += 1
+
+            resolved_template = resolve_template_id(dep_view.ViewTemplateId)
+            if resolved_template != ElementId.InvalidElementId:
+                new_dep.ViewTemplateId = resolved_template
+            if (
+                hasattr(dep_view, "ScopeBox")
+                and dep_view.ScopeBox
+                and dep_view.ScopeBox.IntegerValue != -1
+            ):
+                if dep_view.ScopeBox in scopebox_id_map:
+                    new_dep.ScopeBox = scopebox_id_map[dep_view.ScopeBox]
+            new_dep.CropBoxVisible = dep_view.CropBoxVisible
+            new_dep.CropBoxActive = dep_view.CropBoxActive
+
+            try:
+                dep_mgr = dep_view.GetCropRegionShapeManager()
+                new_mgr = new_dep.GetCropRegionShapeManager()
+                if (
+                    dep_mgr
+                    and new_mgr
+                    and dep_mgr.CanHaveShape()
+                    and new_mgr.CanHaveShape()
+                ):
+                    shapes = dep_mgr.GetCropRegionShape()
+                    if shapes:
+                        shape_list = List[CurveLoop]()
+                        for loop in shapes:
+                            shape_list.Add(loop)
+                        new_mgr.SetCropShape(shape_list)
+            except Exception:
+                pass
+
+            view_id_map[dep_view.Id] = new_dep_id
         t.Commit()
     return view_id_map
 
@@ -253,6 +362,24 @@ def copy_views(source_doc, target_doc, views, scopebox_id_map):
 # === STEP 5: COPY SHEETS AND PLACE VIEWS
 def copy_sheets(source_doc, target_doc, sheets, view_id_map):
     from Autodesk.Revit.DB import Viewport
+
+    def get_titleblock_type_id(document, sheet):
+        # Revit 2020+ has GetTitleBlockIds, but fall back if unavailable
+        if hasattr(sheet, "GetTitleBlockIds"):
+            tb_ids = sheet.GetTitleBlockIds()
+            if tb_ids:
+                titleblock = document.GetElement(list(tb_ids)[0])
+                if titleblock:
+                    return titleblock.GetTypeId()
+        collector = (
+            FilteredElementCollector(document, sheet.Id)
+            .OfCategory(BuiltInCategory.OST_TitleBlocks)
+            .WhereElementIsNotElementType()
+        )
+        tb = collector.FirstElement()
+        if tb:
+            return tb.GetTypeId()
+        return ElementId.InvalidElementId
 
     existing_sheet_numbers = set(
         s.SheetNumber for s in FilteredElementCollector(target_doc).OfClass(ViewSheet)
@@ -271,13 +398,9 @@ def copy_sheets(source_doc, target_doc, sheets, view_id_map):
                 )
                 count += 1
             # Copy titleblock family
-            titleblock = (
-                source_doc.GetElement(s.GetTitleBlockIds()[0])
-                if s.GetTitleBlockIds()
-                else None
-            )
-            if titleblock:
-                new_sheet = ViewSheet.Create(target_doc, titleblock.GetTypeId())
+            titleblock_type_id = get_titleblock_type_id(source_doc, s)
+            if titleblock_type_id != ElementId.InvalidElementId:
+                new_sheet = ViewSheet.Create(target_doc, titleblock_type_id)
             else:
                 new_sheet = ViewSheet.Create(target_doc, ElementId.InvalidElementId)
             new_sheet.SheetNumber = new_sheet_number
@@ -298,8 +421,7 @@ def copy_sheets(source_doc, target_doc, sheets, view_id_map):
 
 # === MAIN FUNCTION
 def main():
-    # Set this to your main floor plan or sheet view name to copy
-    def pick_main_view_name(doc):
+    def pick_main_view_names(doc):
         view_names = sorted(
             [
                 v.Name
@@ -308,32 +430,73 @@ def main():
             ]
         )
         result = forms.SelectFromList.show(
-            view_names, title="Select Main Floor Plan", multiselect=False
+            view_names,
+            title="Select Main Floor Plan(s)",
+            multiselect=True,
         )
-        return result
+        if not result:
+            return []
+        if isinstance(result, list):
+            return result
+        return [result]
 
-    main_view_name = pick_main_view_name(doc)
-    if not main_view_name:
-        TaskDialog.Show("Cancelled", "No main view selected.")
-        import sys
-
-        sys.exit()
-    # 1. Collect all views, sheets, and scope boxes needed
-    all_views, sheets, scope_box_ids = collect_views_and_sheets(doc, main_view_name)
-    if not all_views or not sheets or not scope_box_ids:
-        TaskDialog.Show("Nothing Found", "No matching views, sheets, or scope boxes.")
+    selected_view_names = pick_main_view_names(doc)
+    if not selected_view_names:
+        TaskDialog.Show("Cancelled", "No main views selected.")
         return
-    # 2. Copy scope boxes to target project
-    scopebox_id_map = copy_scope_boxes(doc, target_doc, scope_box_ids)
-    # 3. Copy views to target, reassigning new scope box IDs
-    view_id_map = copy_views(doc, target_doc, all_views, scopebox_id_map)
-    # 4. Copy sheets and place new views
-    sheet_count = copy_sheets(doc, target_doc, sheets, view_id_map)
-    # 5. Report
-    msg = "Copied {} views, {} sheets, and {} scope boxes.\n".format(
-        len(all_views), sheet_count, len(scope_box_ids)
-    )
-    TaskDialog.Show("Transfer Complete", msg)
+
+    total_views = 0
+    total_sheets = 0
+    total_scope_boxes = 0
+    failures = []
+
+    for main_view_name in selected_view_names:
+        try:
+            all_views, sheets, scope_box_ids = collect_views_and_sheets(
+                doc, main_view_name
+            )
+            if not all_views or not sheets:
+                failures.append(
+                    "{}: No matching views or sheets found.".format(main_view_name)
+                )
+                continue
+
+            scopebox_id_map = (
+                copy_scope_boxes(doc, target_doc, scope_box_ids)
+                if scope_box_ids
+                else {}
+            )
+            view_id_map = copy_views(doc, target_doc, all_views, scopebox_id_map)
+            sheet_count = copy_sheets(doc, target_doc, sheets, view_id_map)
+
+            total_views += len(all_views)
+            total_sheets += sheet_count
+            total_scope_boxes += len(scope_box_ids)
+        except Exception as exc:
+            failures.append("{}: {}".format(main_view_name, exc))
+
+    if total_views == 0 and failures:
+        TaskDialog.Show(
+            "Transfer Failed",
+            "No views were copied.\n{}".format("\n".join(failures[:5])),
+        )
+        return
+
+    msg_lines = [
+        "Copied {} views, {} sheets, and {} scope boxes.".format(
+            total_views, total_sheets, total_scope_boxes
+        )
+    ]
+    if failures:
+        msg_lines.append(
+            "Skipped {} selection(s):\n{}".format(
+                len(failures), "\n".join(failures[:5])
+            )
+        )
+        if len(failures) > 5:
+            msg_lines.append("...and more. See console for details.")
+
+    TaskDialog.Show("Transfer Complete", "\n".join(msg_lines))
 
 
 main()

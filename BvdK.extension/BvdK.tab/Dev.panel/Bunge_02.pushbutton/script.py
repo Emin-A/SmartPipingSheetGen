@@ -1,18 +1,36 @@
 # -*- coding: utf-8 -*-
 __title__ = "Bunge Sheet Gen"
-__doc__ = """Version = 1.0
+__doc__ = """Version = 1.1  (safe-mode)
 Date    = 21.07.2025
 ________________________________________________________________
 Description:
-
+Creates a cropped prefab plan from a user-drawn boundary, numbers
+Pipes/Fittings 'Comments', auto-tags pipes (no leaders), and places
+the view on a new sheet (safe defaults to avoid regen thrash).
 ________________________________________________________________
 How-To:
-
-1. [Hold ALT + CLICK] on the button to open its source folder.
-2. Create your boundary (with detail lines) in the view.
-3. Click the button and follow the prompts.
+1. Draw a closed loop with Detail Lines around the region.
+2. Run the tool, edit/confirm codes, press OK.
+3. Pick a title block, done.
 ________________________________________________________________
-Author: Emin Avdovic"""
+Author: Emin Avdovic (safe-mode refactor)
+"""
+
+# =========================
+# SAFE MODE SWITCHES
+# =========================
+SAFE_CFG = {
+    "duplicate_with_detailing": False,  # False => minimal duplication (safer)
+    "place_text_note": True,  # place tiny text note inside crop
+    "autotag_pipes": True,  # create tags for untagged pipes
+    "tag_use_leader": False,  # leaderless tags = lighter regen
+    "create_3d_view": False,  # disabled for stability
+    "place_schedule": False,  # disabled for stability
+    "hide_crop_region_controls": True,  # keep the crop visible OFF
+    "annotation_crop_on": False,  # annotation crop OFF for stability
+    "view_scale": 50,  # plan scale
+    "view_discipline": "Coordination",  # Coordination is stable
+}
 
 # ==================================================
 # Imports
@@ -25,44 +43,26 @@ from Autodesk.Revit.DB import (
     FamilySymbol,
     FamilyInstance,
     FilteredElementCollector,
-    FormatOptions,
-    FilterStringRule,
-    FilterStringRuleEvaluator,
-    FilterStringBeginsWith,
-    FilterStringContains,
-    FilterStringEquals,
     XYZ,
     Transaction,
     TextNote,
     TextNoteType,
     TextNoteOptions,
     IndependentTag,
-    UV,
     UnitTypeId,
     Reference,
     TagMode,
     TagOrientation,
-    ViewSchedule,
     ViewSheet,
     ViewDuplicateOption,
     ViewDiscipline,
     Viewport,
     ViewPlan,
-    ParameterValueProvider,
-    ParameterFilterElement,
-    ScheduleSheetInstance,
-    ScheduleFilter,
-    ScheduleFilterType,
-    ScheduleSortGroupField,
-    ScheduleSortOrder,
     StorageType,
-    SectionType,
     Category,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.UI import *
-from Autodesk.Revit.UI import TaskDialog
-from Autodesk.Revit.UI import UIDocument
 from Autodesk.Revit.DB.Structure import *
 from Autodesk.Revit.Exceptions import *
 from Autodesk.Revit.Attributes import *
@@ -82,14 +82,8 @@ clr.AddReference("RevitAPIUI")
 clr.AddReference("WindowsBase")
 from RevitServices.Persistence import DocumentManager
 from System.Windows.Forms import (
-    FormBorderStyle,
-    AnchorStyles,
-    AutoScaleMode,
     Form,
-    ComboBox,
     ListBox,
-    PictureBox,
-    PictureBoxSizeMode,
     DataGridView,
     DataGridViewTextBoxColumn,
     DataGridViewButtonColumn,
@@ -101,13 +95,9 @@ from System.Windows.Forms import (
     MessageBox,
     DialogResult,
     Label,
-    ScrollBars,
     Application,
 )
-from System.Drawing import Image, Point, Color, Rectangle, Size
-from System.IO import MemoryStream
-from System.Windows.Forms import DataGridViewButtonColumn
-
+from System.Drawing import Point, Color, Rectangle, Size
 from System import Array
 import math, re, sys
 
@@ -121,10 +111,14 @@ doc = __revit__.ActiveUIDocument.Document
 VERBOSE = False
 
 
-# === TO HIDE THE DEBUG CONSOLE ===
-# def debug(*args):
-#     if VERBOSE:
-#         print(" ".join([str(a) for a in args]))
+def debug(*args):
+    if VERBOSE:
+        print(" ".join([str(a) for a in args]))
+
+
+# ==================================================
+# Utilities
+# ==================================================
 def safe_int(value, default=0):
     try:
         return int(str(value))
@@ -132,44 +126,13 @@ def safe_int(value, default=0):
         return default
 
 
-def parse_base_code(text):
-    # returns ("1.2.3", ["1","2","3"]) or (None, [])
-    m = re.search(r"(\d+(?:\.\d+)*)", text or "")
-    if not m:
-        return None, []
-    base = m.group(1)
-    parts = [p for p in base.split(".") if p.isdigit()]
-    return base, parts
+def mm_to_ft(mm):
+    return UnitUtils.ConvertToInternalUnits(mm, UnitTypeId.Millimeters)
 
 
-def safe_next(iterable, predicate):
-    for item in iterable:
-        if predicate(item):
-            return item
-    return None
-
-
-def debug(*args):
-    if VERBOSE:
-        print(" ".join([str(a) for a in args]))
-
-
-# ==================================================
-# Helper Functions
-# ==================================================
-
-
-# --- Boundary Selection Functions ---
-class DetailLineSelectionFilter(ISelectionFilter):
-    def AllowElement(self, elem):
-        if elem.Category and elem.Category.Id.IntegerValue == int(
-            BuiltInCategory.OST_Lines
-        ):
-            return True
-        return False
-
-    def AllowReference(self, ref, point):
-        return False
+Z_BAND = mm_to_ft(1500.0)
+XY_PAD = mm_to_ft(50.0)
+INSET = mm_to_ft(15.0)  # tiny inset to avoid grazing zeros
 
 
 def points_are_close(pt1, pt2, tol=1e-6):
@@ -204,21 +167,17 @@ def order_segments_to_polygon(segments):
     if polygon and points_are_close(polygon[0], polygon[-1]):
         polygon.pop()
         return polygon
-    else:
-        return None
+    return None
 
 
 def is_point_inside_polygon(point, polygon):
-    x = point.X
-    y = point.Y
+    x, y = point.X, point.Y
     inside = False
     n = len(polygon)
     j = n - 1
     for i in range(n):
-        xi = polygon[i].X
-        yi = polygon[i].Y
-        xj = polygon[j].X
-        yj = polygon[j].Y
+        xi, yi = polygon[i].X, polygon[i].Y
+        xj, yj = polygon[j].X, polygon[j].Y
         if ((yi > y) != (yj > y)) and (
             x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
         ):
@@ -227,148 +186,119 @@ def is_point_inside_polygon(point, polygon):
     return inside
 
 
+def polygon_bounds_xy(poly):
+    minx = min(p.X for p in poly)
+    maxx = max(p.X for p in poly)
+    miny = min(p.Y for p in poly)
+    maxy = max(p.Y for p in poly)
+    # safety inset/outset
+    return (minx + INSET, miny + INSET, maxx - INSET, maxy - INSET)
+
+
+class DetailLineSelectionFilter(ISelectionFilter):
+    def AllowElement(self, elem):
+        return bool(
+            elem.Category
+            and elem.Category.Id.IntegerValue == int(BuiltInCategory.OST_Lines)
+        )
+
+    def AllowReference(self, ref, point):
+        return False
+
+
+def convert_param_to_string(param_obj):
+    if not param_obj:
+        return ""
+    try:
+        s = param_obj.AsValueString()
+        if s and s.strip():
+            return s
+    except:
+        pass
+    try:
+        val_mm = param_obj.AsDouble() * 304.8
+        return str(int(round(val_mm))) + " mm"
+    except:
+        return ""
+
+
 def select_boundary_and_gather():
     try:
         selection_refs = uidoc.Selection.PickObjects(
             ObjectType.Element,
             DetailLineSelectionFilter(),
-            "Select boundary detail lines (click on the lines that form a closed loop)",
+            "Select boundary detail lines (closed loop)",
         )
     except Exception:
-        return None
+        return None, None
     if not selection_refs:
-        return None
+        return None, None
 
     segments = []
-    for ref in selection_refs:
-        elem = doc.GetElement(ref)
+    for r in selection_refs:
+        el = doc.GetElement(r)
         try:
-            curve = elem.GeometryCurve
-            start = curve.GetEndPoint(0)
-            end = curve.GetEndPoint(1)
-            segments.append((start, end))
-        except Exception:
-            continue
+            crv = el.GeometryCurve
+            segments.append((crv.GetEndPoint(0), crv.GetEndPoint(1)))
+        except:
+            pass
 
     polygon = order_segments_to_polygon(segments[:])
     if polygon is None:
-        MessageBox.Show(
-            "The selected detail lines do not form a closed boundary.", "Error"
-        )
-        return None
+        MessageBox.Show("The selected lines do not form a closed loop.", "Error")
+        return None, None
 
+    active_plan = uidoc.ActiveView
+    level_z = 0.0
+    if isinstance(active_plan, ViewPlan) and active_plan.GenLevel:
+        level_z = doc.GetElement(active_plan.GenLevel.Id).Elevation
+    z_min = level_z - Z_BAND
+    z_max = level_z + Z_BAND
+
+    def rects_overlap(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
+        return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+    pminx, pminy, pmaxx, pmaxy = polygon_bounds_xy(polygon)
     collector = (
         FilteredElementCollector(doc, uidoc.ActiveView.Id)
         .WhereElementIsNotElementType()
         .ToElements()
     )
     elements_inside = []
+
     for elem in collector:
-        bbox = elem.get_BoundingBox(uidoc.ActiveView)
-        if bbox:
-            center = XYZ(
-                (bbox.Min.X + bbox.Max.X) / 2.0,
-                (bbox.Min.Y + bbox.Max.Y) / 2.0,
-                (bbox.Min.Z + bbox.Max.Z) / 2.0,
-            )
-            if is_point_inside_polygon(center, polygon):
-                elements_inside.append(elem)
-
-    MessageBox.Show(
-        "Found {0} element(s) inside the selected boundary.".format(
-            len(elements_inside)
-        ),
-        "Boundary Selection",
-    )
-    return elements_inside
-
-
-# --- Parameter and Region Helpers ---
-def convert_param_to_string(param_obj):
-    if not param_obj:
-        return ""
-    try:
-        val_str = param_obj.AsValueString()
-        if val_str and val_str.strip() != "":
-            return val_str
-    except Exception:
-        pass
-    try:
-        val_double = param_obj.AsDouble()
-        val_mm = val_double * 304.8
-        return str(int(round(val_mm))) + " mm"
-    except Exception:
-        return ""
-
-
-def get_region_bounding_box(elements):
-    valid_found = False
-    overall_min_x = float("inf")
-    overall_min_y = float("inf")
-    overall_min_z = float("inf")
-    overall_max_x = float("-inf")
-    overall_max_y = float("-inf")
-    overall_max_z = float("-inf")
-
-    for el in elements:
-        try:
-            bbox = el.get_BoundingBox(uidoc.ActiveView)
-        except:
-            continue  # skip if element was just deleted
-        if not bbox:
+        bb = elem.get_BoundingBox(uidoc.ActiveView)
+        if not bb:
             continue
-        if bbox is None:
+        if bb.Max.Z < z_min or bb.Min.Z > z_max:
             continue
-        if (
-            bbox.Min.X == float("inf")
-            or bbox.Min.Y == float("inf")
-            or bbox.Min.Z == float("inf")
+        if not rects_overlap(
+            bb.Min.X, bb.Min.Y, bb.Max.X, bb.Max.Y, pminx, pminy, pmaxx, pmaxy
         ):
             continue
-        valid_found = True
-        overall_min_x = min(overall_min_x, bbox.Min.X)
-        overall_min_y = min(overall_min_y, bbox.Min.Y)
-        overall_min_z = min(overall_min_z, bbox.Min.Z)
-        overall_max_x = max(overall_max_x, bbox.Max.X)
-        overall_max_y = max(overall_max_y, bbox.Max.Y)
-        overall_max_z = max(overall_max_z, bbox.Max.Z)
 
-    if not valid_found:
-        return XYZ(0, 0, 0), XYZ(0, 0, 0)
+        center = XYZ((bb.Min.X + bb.Max.X) * 0.5, (bb.Min.Y + bb.Max.Y) * 0.5, 0)
+        inside = is_point_inside_polygon(center, polygon)
+        if inside:
+            elements_inside.append(elem)
 
-    overall_min = XYZ(overall_min_x, overall_min_y, overall_min_z)
-    overall_max = XYZ(overall_max_x, overall_max_y, overall_max_z)
-    return overall_min, overall_max
-
-
-def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
-    t = Transaction(doc, "Add Missing Pipe Tags")
-    t.Start()
-    for pipe in pipes:
-        bbox = pipe.get_BoundingBox(view)
-        if not bbox:
-            continue
-        center = XYZ(
-            (bbox.Min.X + bbox.Max.X) / 2.0,
-            (bbox.Min.Y + bbox.Max.Y) / 2.0,
-            (bbox.Min.Z + bbox.Max.Z) / 2.0,
-        )
-        pipe_ref = Reference(pipe)
-        IndependentTag.Create(
-            doc,
-            view.Id,
-            pipe_ref,
-            True,
-            TagMode.TM_ADDBY_CATEGORY,
-            TagOrientation.Horizontal,
-            XYZ(center.X, center.Y, 0),
-        )
-    t.Commit()
+    MessageBox.Show(
+        "Found {0} element(s) in region.".format(len(elements_inside)), "Boundary"
+    )
+    return elements_inside, polygon
 
 
 # ==================================================
-# UI Class: ElementEditorForm
+# Data grid UI (unchanged core behavior; cleaned a bit)
 # ==================================================
+from System.Windows.Forms import (
+    Panel,
+    DataGridViewTextBoxColumn,
+    DataGridViewButtonColumn,
+    DataGridViewAutoSizeColumnsMode,
+)
+
+
 class ElementEditorForm(Form):
     def __init__(self, elements_data, region_elements=None):
         self.Text = "Edit Element Codes"
@@ -378,1025 +308,289 @@ class ElementEditorForm(Form):
         self.SuspendLayout()
         self.regionElements = region_elements
 
-        # --- 1. Bottom Buttons Panel FIRST
-        self.buttonPanel = System.Windows.Forms.Panel()
-        self.buttonPanel.Height = 50
+        self.buttonPanel = Panel()
+        self.buttonPanel.Height = 48
         self.buttonPanel.Dock = DockStyle.Bottom
         self.Controls.Add(self.buttonPanel)
-
-        # --- 2. Panel for the DataGridView SECOND
-        self.gridPanel = System.Windows.Forms.Panel()
+        self.gridPanel = Panel()
         self.gridPanel.Dock = DockStyle.Fill
         self.Controls.Add(self.gridPanel)
 
         self.dataGrid = DataGridView()
-        self.dataGrid.SelectionChanged += self.on_row_selected
         self.dataGrid.Dock = DockStyle.Fill
         self.dataGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
-        self.dataGrid.CellContentClick += self.dataGrid_CellContentClick
         self.dataGrid.MultiSelect = True
         self.dataGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        self.dataGrid.SelectionChanged += self.on_row_selected
         self.gridPanel.Controls.Add(self.dataGrid)
 
-        # --- 3. Columns
-        self.colId = DataGridViewTextBoxColumn()
-        self.colId.Name = "Id"
-        self.colId.HeaderText = "Element Id"
-        self.colId.ReadOnly = True
+        # columns
+        cols = []
 
-        self.colCategory = DataGridViewTextBoxColumn()
-        self.colCategory.Name = "Category"
-        self.colCategory.HeaderText = "Category"
-        self.colCategory.ReadOnly = True
+        def add_col(name, header, ro=True):
+            c = DataGridViewTextBoxColumn()
+            c.Name = name
+            c.HeaderText = header
+            c.ReadOnly = ro
+            cols.append(c)
 
-        self.category_headers = {}
-        self.collapsed_categories = set()
-
-        self.colName = DataGridViewTextBoxColumn()
-        self.colName.Name = "Name"
-        self.colName.HeaderText = "Name"
-        self.colName.ReadOnly = True
-
-        self.colWarning = DataGridViewTextBoxColumn()
-        self.colWarning.Name = "Warning"
-        self.colWarning.HeaderText = "Warning"
-        self.colWarning.ReadOnly = True
-
-        self.colBend45 = DataGridViewTextBoxColumn()
-        self.colBend45.Name = "Bend45"
-        self.colBend45.HeaderText = "2x45°"
-        self.colBend45.ReadOnly = True
-
-        self.colDefaultCode = DataGridViewTextBoxColumn()
-        self.colDefaultCode.Name = "DefaultCode"
-        self.colDefaultCode.HeaderText = "Default Code"
-        self.colDefaultCode.ReadOnly = True
-
-        self.colNewCode = DataGridViewTextBoxColumn()
-        self.colNewCode.Name = "NewCode"
-        self.colNewCode.HeaderText = "New Code"
-        self.colNewCode.ReadOnly = False
-
-        self.colOD = DataGridViewTextBoxColumn()
-        self.colOD.Name = "OutsideDiameter"
-        self.colOD.HeaderText = "Outside Diameter"
-        self.colOD.ReadOnly = True
-
-        self.colLength = DataGridViewTextBoxColumn()
-        self.colLength.Name = "Length"
-        self.colLength.HeaderText = "Length"
-        self.colLength.ReadOnly = True
-
-        self.colSize = DataGridViewTextBoxColumn()
-        self.colSize.Name = "Size"
-        self.colSize.HeaderText = "Size"
-        self.colSize.ReadOnly = True
-
-        self.colArticle = DataGridViewTextBoxColumn()
-        self.colArticle.Name = "GEB_Article_Number"
-        self.colArticle.HeaderText = "GEB Article No."
-        self.colArticle.ReadOnly = True
+        add_col("Id", "Element Id")
+        add_col("Category", "Category")
+        add_col("Name", "Name")
+        add_col("Warning", "Warning")
+        add_col("Bend45", "2x45°")
+        add_col("DefaultCode", "Default Code")
+        add_col("NewCode", "New Code", ro=False)
+        add_col("OutsideDiameter", "Outside Diameter")
+        add_col("Length", "Length")
+        add_col("Size", "Size")
+        add_col("GEB_Article_Number", "GEB Article No.")
 
         self.colTagStatus = DataGridViewButtonColumn()
         self.colTagStatus.Name = "TagStatus"
         self.colTagStatus.HeaderText = "Tags"
         self.colTagStatus.UseColumnTextForButtonValue = False
 
-        self.dataGrid.Columns.AddRange(
-            Array[DataGridViewTextBoxColumn](
-                [
-                    self.colId,
-                    self.colCategory,
-                    self.colName,
-                    self.colWarning,
-                    self.colBend45,
-                    self.colDefaultCode,
-                    self.colNewCode,
-                    self.colOD,
-                    self.colLength,
-                    self.colSize,
-                ]
-            )
-        )
-        self.dataGrid.Columns.Add(self.colArticle)
+        self.dataGrid.Columns.AddRange(Array[DataGridViewTextBoxColumn](cols))
         self.dataGrid.Columns.Add(self.colTagStatus)
+        self.dataGrid.CellContentClick += self.dataGrid_CellContentClick
 
-        # 1. Text Note Code Input with Example Text
+        # text note input
         self.txtTextNoteCode = TextBox()
-        self.txtTextNoteCode.Width = 150
+        self.txtTextNoteCode.Width = 160
         self.txtTextNoteCode.ForeColor = Color.Gray
         self.txtTextNoteCode.Text = "prefab 5.5.5"
-        self.txtTextNoteCode.GotFocus += self.clear_placeholder
-        self.txtTextNoteCode.LostFocus += self.restore_placeholder
+        self.txtTextNoteCode.GotFocus += self._clear_placeholder
+        self.txtTextNoteCode.LostFocus += self._restore_placeholder
         self.buttonPanel.Controls.Add(self.txtTextNoteCode)
 
-        # --- 4. Buttons inside buttonPanel
-        self.btnPlaceTextNote = Button()
-        self.btnPlaceTextNote.Text = "Place Text Note"
-        self.btnPlaceTextNote.Width = 150
-        self.btnPlaceTextNote.Click += self.btnPlaceTextNote_Click
-        self.buttonPanel.Controls.Add(self.btnPlaceTextNote)
+        # buttons
+        def add_btn(text, handler, w=150):
+            b = Button()
+            b.Text = text
+            b.Width = w
+            b.Click += handler
+            self.buttonPanel.Controls.Add(b)
+            return b
 
-        self.btnFixReducers = Button()
-        self.btnFixReducers.Text = "Fix Reducers"
-        self.btnFixReducers.Width = 150
-        self.btnFixReducers.Click += self.btnFixReducers_Click
-        self.buttonPanel.Controls.Add(self.btnFixReducers)
+        self.btnAutoFill = add_btn("Auto-Fill Tag Codes", self.autoFillPipeTagCodes)
+        self.btnOK = add_btn("OK", self.okButton_Click, 80)
+        self.btnCancel = add_btn("Cancel", self._cancel, 80)
+        self.buttonPanel.Resize += self._layout_buttons
 
-        self.btnBulkTags = Button()
-        self.btnBulkTags.Text = "Add/Remove Tags"
-        self.btnBulkTags.Width = 150
-        self.btnBulkTags.Click += self.bulkAddRemoveTags_Click
-        self.buttonPanel.Controls.Add(self.btnBulkTags)
-
-        self.btnAutoFill = Button()
-        self.btnAutoFill.Text = "Auto-Fill Tag Codes"
-        self.btnAutoFill.Width = 150
-        self.btnAutoFill.Click += self.autoFillPipeTagCodes
-        self.buttonPanel.Controls.Add(self.btnAutoFill)
-
-        self.btnOK = Button()
-        self.btnOK.Text = "OK"
-        self.btnOK.Width = 80
-        self.btnOK.DialogResult = DialogResult.OK
-        self.btnOK.Click += self.okButton_Click
-        self.buttonPanel.Controls.Add(self.btnOK)
-
-        self.btnCancel = Button()
-        self.btnCancel.Text = "Cancel"
-        self.btnCancel.Width = 80
-        self.btnCancel.DialogResult = DialogResult.Cancel
-        self.buttonPanel.Controls.Add(self.btnCancel)
-
-        # --- 5. Smart Button Alignment
-        self.buttonPanel.Resize += self.rearrange_buttons
-
-        self.ResumeLayout(False)
-        self.PerformLayout()
-        self.buttonPanel.PerformLayout()
-        self.gridPanel.PerformLayout()
-        self.dataGrid.PerformLayout()
-
-        # --- 6. State
         self.textNotePlaced = False
         self.Result = None
 
-        # --- 7. Populate Rows
+        # populate
         for ed in elements_data:
-            row_idx = self.dataGrid.Rows.Add()
-            row = self.dataGrid.Rows[row_idx]
+            ridx = self.dataGrid.Rows.Add()
+            row = self.dataGrid.Rows[ridx]
             row.Cells["Id"].Value = ed["Id"]
             row.Cells["Category"].Value = ed["Category"]
             row.Cells["Name"].Value = ed["Name"]
             row.Cells["Warning"].Value = ed.get("Warning", "")
             row.Cells["Bend45"].Value = ed.get("Bend45", "")
-            row.Cells["GEB_Article_Number"].Value = ed.get("GEB_Article_Number", "")
             row.Cells["DefaultCode"].Value = ed["DefaultCode"]
             row.Cells["NewCode"].Value = ed["NewCode"]
             row.Cells["OutsideDiameter"].Value = ed["OutsideDiameter"]
             row.Cells["Length"].Value = ed["Length"]
             row.Cells["Size"].Value = ed.get("Size", "")
+            row.Cells["GEB_Article_Number"].Value = ed.get("GEB_Article_Number", "")
 
-            # TagStatus logic
             cat = ed["Category"]
-            name = ed["Name"]
-            name_lc = name.lower()
-            warning_val = row.Cells["Warning"].Value or ""
-            debug(">> Pipe Fitting Name:", name)
-
             if cat == "Pipes":
-                if ed["TagStatus"] == "Yes":
-                    row.Cells["TagStatus"].Value = "Remove Tag"
-                else:
-                    row.Cells["TagStatus"].Value = "Add/Place Tag"
+                row.Cells["TagStatus"].Value = (
+                    "Remove Tag" if ed["TagStatus"] == "Yes" else "Add/Place Tag"
+                )
                 row.DefaultCellStyle.BackColor = Color.LightBlue
-
             elif cat == "Pipe Tags":
                 row.Cells["TagStatus"].Value = "Remove Tag"
                 row.DefaultCellStyle.BackColor = Color.LightGreen
-
-            elif cat == "Text Notes":
+            elif cat == "Pipe Fittings":
+                row.Cells["TagStatus"].Value = ""
+                row.Cells["TagStatus"].ReadOnly = True
+                row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
+            else:
                 row.Cells["TagStatus"].Value = ""
                 row.DefaultCellStyle.BackColor = Color.LightGray
 
-            elif cat == "Pipe Fittings":
-                elem = doc.GetElement(ElementId(int(ed["Id"])))
-                family_name = ""
-                if isinstance(elem, FamilyInstance):
-                    symbol = elem.Symbol
-                    if symbol and symbol.Family:
-                        family_name = symbol.Family.Name.lower()
+        self.ResumeLayout(False)
 
-                row.Cells["TagStatus"].Value = ""
-                row.Cells["TagStatus"].ReadOnly = True
+    def _layout_buttons(self, sender, e):
+        ctrls = list(self.buttonPanel.Controls)
+        total_w = sum(c.Width for c in ctrls)
+        avail = self.buttonPanel.Width - total_w
+        spacing = max(10, avail // (len(ctrls) + 1))
+        x = spacing
+        for c in ctrls:
+            c.Location = Point(x, (self.buttonPanel.Height - c.Height) // 2)
+            x += c.Width + spacing
 
-                if "var. dn/od" in name_lc:
-                    if "multibocht" in name_lc or "multibocht" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip 2x45°"
-                        row.Cells["TagStatus"].ReadOnly = False
-                    elif "liggend" in name_lc or "liggend" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip T-stuk"
-                        row.Cells["TagStatus"].ReadOnly = False
-                        # row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
-                    elif "multireducer" in name_lc or "multireducer_geb" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip Reducer"
-                        row.Cells["TagStatus"].ReadOnly = False
-
-                row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
-
-    def auto_fix_inline(self):
-        updated = 0
-        skipped = 0
-
-        for row in self.dataGrid.Rows:
-            try:
-                cat = row.Cells["Category"].Value
-                if cat != "Pipe Fittings":
-                    continue
-
-                eid = safe_int(row.Cells["Id"].Value)
-                elem = doc.GetElement(ElementId(eid))
-                if not elem or not elem.IsValidObject:
-                    continue
-
-                name = elem.Name
-                debug("Checking:", elem.Id, "| Name:", name)
-
-                # 1. Fix concentric reducers
-                reducer_fixed = False
-                p_warn = elem.LookupParameter("waarschuwing")
-                warning = p_warn.AsString() if p_warn else ""
-                debug(" -> Warning:", warning)
-
-                has_concentric_warning = warning and "concentric" in warning.lower()
-
-                has_reducer_params = any(
-                    elem.LookupParameter(pn)
-                    for pn in [
-                        "kort_verloop (kleinste)",
-                        "kort_verloop (grootste)",
-                        "reducer_eccentric",
-                        "switch_excentriciteit",
-                    ]
-                )
-                if has_concentric_warning and has_reducer_params:
-                    param_map = {
-                        "kort_verloop (kleinste)": True,
-                        "kort_verloop (grootste)": True,
-                        "reducer_eccentric": True,
-                        "switch_excentriciteit": False,
-                    }
-                    t = Transaction(doc, "Fix Reducer")
-                    t.Start()
-                    for pname, value in param_map.items():
-                        p = elem.LookupParameter(pname)
-                        if p and p.StorageType == StorageType.Integer:
-                            p.Set(1 if value else 0)
-                    t.Commit()
-                    debug(" -> Reducer fixed.")
-                    updated += 1
-                    reducer_fixed = True
-
-                # 2. Turn OFF 2x45°
-                p_bend = elem.LookupParameter("2x45°")
-                if p_bend and p_bend.StorageType == StorageType.Integer:
-                    if p_bend.AsInteger() == 1:
-                        debug(" -> Turning OFF 2x45°")
-                        t = Transaction(doc, "Turn off 2x45°")
-                        t.Start()
-                        p_bend.Set(0)
-                        t.Commit()
-                        updated += 1
-                    elif not reducer_fixed:
-                        debug(" -> 2x45° already OFF")
-                        skipped += 1
-                elif not reducer_fixed:
-                    skipped += 1
-
-                # Auto toggle 2x45 degree for elbows based on vertical pipe diameter
-                if isinstance(elem, FamilyInstance):
-                    fam_name = elem.Symbol.Family.Name.lower()
-                    if "bocht_sh_geb" in fam_name or "bocht" in fam_name:
-                        connector_mgr = elem.MEPModel.ConnectorManager
-                        vertical_diam = None
-
-                        for conn in connector_mgr.Connectors:
-                            dir = conn.CoordinateSystem.BasisZ
-                            if abs(dir.Z) > 0.9:
-                                try:
-                                    connected = list(conn.AllRefs)
-                                    for ref in connected:
-                                        if ref.Owner.Id != elem.Id and hasattr(
-                                            ref.Owner, "LookupParameter"
-                                        ):
-                                            pipe = ref.Owner
-                                            diam_param = pipe.LookupParameter(
-                                                "Outside Diameter"
-                                            ) or pipe.LookupParameter("Diameter")
-                                            if diam_param:
-                                                d_mm = diam_param.AsDouble() * 304.8
-                                                vertical_diam = d_mm
-                                                break
-                                except Exception as ex:
-                                    debug(
-                                        "⚠️ Failed to resolve vertical pipe diameter:",
-                                        ex,
-                                    )
-
-                        if vertical_diam is not None:
-                            try:
-                                bend_param = elem.LookupParameter("2x45°")
-                                if (
-                                    bend_param
-                                    and bend_param.StorageType == StorageType.Integer
-                                ):
-                                    t = Transaction(doc, "Set 2x45° for elbow")
-                                    t.Start()
-                                    if vertical_diam > 100:
-                                        bend_param.Set(1)
-                                        debug(
-                                            "✅ 2x45° turned ON for:",
-                                            elem.Id,
-                                            "| Ø =",
-                                            vertical_diam,
-                                        )
-                                    else:
-                                        bend_param.Set(0)
-                                        debug(
-                                            "✅ 2x45° turned OFF for:",
-                                            elem.Id,
-                                            "| Ø =",
-                                            vertical_diam,
-                                        )
-                                    t.Commit()
-                                    updated += 1
-                            except Exception as ex:
-                                debug("❌ Failed to set 2x45° on elbow:", ex)
-
-                    # Auto toggle reducer_eccentric for multireducer going UP
-                    elif "multireducer_geb" in fam_name:
-                        try:
-                            connector_mgr = elem.MEPModel.ConnectorManager
-                            is_vertical_up = False
-
-                            for conn in connector_mgr.Connectors:
-                                dir = conn.CoordinateSystem.BasisZ
-                                if abs(dir.Z) > 0.9:
-                                    connected = list(conn.AllRefs)
-                                    for ref in connected:
-                                        if ref.Owner.Id != elem.Id:
-                                            # Check if the direction is upward
-                                            vec = conn.CoordinateSystem.BasisZ
-                                            if vec.Z > 0.9:
-                                                is_vertical_up = True
-                                                break
-                                    if is_vertical_up:
-                                        break
-
-                            if is_vertical_up:
-                                reducer_param = elem.LookupParameter(
-                                    "reducer_eccentric"
-                                )
-                                if reducer_param and reducer_param.AsInteger() == 1:
-                                    t = Transaction(doc, "Auto-Fix Reducer Eccentric")
-                                    t.Start()
-                                    reducer_param.Set(0)
-                                    t.Commit()
-                                    debug(
-                                        "✅ Turned OFF reducer_eccentric for vertical-up multireducer:",
-                                        elem.Id,
-                                    )
-                                    updated += 1
-                        except Exception as ex:
-                            debug("❌ Failed to auto-toggle reducer_eccentric:", ex)
-
-            except Exception as ex:
-                debug("Exception while processing:", ex)
-                skipped += 1
-
-        return updated, skipped
-
-    def btnFixReducers_Click(self, sender, event):
-
-        updated, skipped = self.auto_fix_inline()
-
-        for row in self.dataGrid.Rows:
-            cat = row.Cells["Category"].Value
-            if cat != "Pipe Fittings":
-                continue
-
-            try:
-                eid = safe_int(row.Cells["Id"].Value)
-                elem = doc.GetElement(ElementId(eid))
-                if not elem:
-                    continue
-
-                name = row.Cells["Name"].Value
-                tag_status = row.Cells["TagStatus"].Value
-
-                # Flip 2x45° logic (manual logic reused)
-                if tag_status == "Flip 2x45°":
-                    debug(">> Activating Flip 2x45° for:", name)
-                    if isinstance(elem, FamilyInstance):
-                        try:
-                            bend_param = elem.LookupParameter("bend_visible")
-                            preserve_param = elem.LookupParameter(
-                                "bend_visible_preserve"
-                            )
-
-                            if (
-                                bend_param
-                                and bend_param.StorageType == StorageType.Integer
-                            ):
-                                bend_param.Set(0)
-                                debug(" -> bend_visible OFF")
-
-                            if (
-                                preserve_param
-                                and preserve_param.StorageType == StorageType.Integer
-                            ):
-                                preserve_param.Set(0)
-                                debug(" -> bend_visible_preserve OFF")
-
-                            debug("✅ Flip 2x45° applied to:", eid)
-                        except Exception as e:
-                            debug("⚠️ Failed to flip 2x45° for", eid, "Error:", str(e))
-
-                # New: Vertical Reducer Detection & Fix
-                name_lc = name.lower()
-                if "multireducer_geb" in name_lc and "var. dn/od" in name_lc:
-                    try:
-                        is_vertical = False
-                        if hasattr(elem, "HandOrientation"):
-                            dir = elem.HandOrientation
-                            debug("Orientation vector (HandOrientation):", dir)
-                            if abs(dir.Z) > 0.9:
-                                is_vertical = True
-
-                        debug(
-                            "Checking vertical reducer:",
-                            eid,
-                            "| is_vertical =",
-                            is_vertical,
-                        )
-
-                        if is_vertical:
-                            reducer_param = elem.LookupParameter("reducer_eccentric")
-                            geom_param = elem.LookupParameter("geom_exc")
-
-                            t = Transaction(doc, "Fix Vertical Reducer")
-                            t.Start()
-
-                            if reducer_param and reducer_param.AsInteger() == 1:
-                                reducer_param.Set(0)
-                                debug(" -> reducer_eccentric turned OFF")
-
-                            if geom_param and geom_param.AsInteger() == 1:
-                                geom_param.Set(0)
-                                debug(" -> geom_exc turned OFF")
-
-                            t.Commit()
-                            debug("✅ Fixed vertical reducer for:", eid)
-                    except Exception as ve:
-                        debug(
-                            "❌ Error fixing vertical reducer for:", eid, "Error:", ve
-                        )
-
-                # Re-read parameters from Revit
-                p_warn = elem.LookupParameter("waarschuwing")
-                warning_val = p_warn.AsString() if p_warn else ""
-                row.Cells["Warning"].Value = warning_val
-
-                p_bend = elem.LookupParameter("2x45°")
-                if p_bend and p_bend.StorageType == StorageType.Integer:
-                    bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
-                    row.Cells["Bend45"].Value = bend45_val
-            except:
-                continue
-
-        MessageBox.Show(
-            "✅ Reducers Fixed!\n\nUpdated: {}\nSkipped: {}".format(updated, skipped),
-            "Fix Reducers",
-        )
-
-    def clear_placeholder(self, sender, event):
+    def _clear_placeholder(self, sender, e):
         if self.txtTextNoteCode.Text == "prefab 5.5.5":
             self.txtTextNoteCode.Text = ""
             self.txtTextNoteCode.ForeColor = Color.Black
 
-    def restore_placeholder(self, sender, event):
-        if self.txtTextNoteCode.Text.strip() == "":
+    def _restore_placeholder(self, sender, e):
+        if not self.txtTextNoteCode.Text.strip():
             self.txtTextNoteCode.Text = "prefab 5.5.5"
             self.txtTextNoteCode.ForeColor = Color.Gray
 
-    def bulkAddRemoveTags_Click(self, sender, event):
-        rows_to_process = []
-        for row in self.dataGrid.Rows:
-            cat = row.Cells["Category"].Value
-            if cat == "Pipes":
-                rows_to_process.append(row)
-
-        for row in rows_to_process:
-            val = row.Cells["TagStatus"].Value
-            host_id = safe_int(row.Cells["Id"].Value)
-            host = doc.GetElement(ElementId(host_id))
-
-            if val == "Add/Place Tag":
-                tr = Transaction(doc, "Add Tag")
-                tr.Start()
-                bb = host.get_BoundingBox(uidoc.ActiveView)
-                if bb:
-                    ctr = XYZ(
-                        (bb.Min.X + bb.Max.X) / 2.0,
-                        (bb.Min.Y + bb.Max.Y) / 2.0,
-                        (bb.Min.Z + bb.Max.Z) / 2.0,
-                    )
-                    ref = Reference(host)
-                    new_tag = IndependentTag.Create(
-                        doc,
-                        doc.ActiveView.Id,
-                        ref,
-                        True,
-                        TagMode.TM_ADDBY_CATEGORY,
-                        TagOrientation.Horizontal,
-                        ctr,
-                    )
-                tr.Commit()
-                row.Cells["TagStatus"].Value = "Remove Tag"
-                te = doc.GetElement(new_tag.Id)
-                if te:
-                    data = {
-                        "Id": str(te.Id),
-                        "Category": "Pipe Tags",
-                        "Name": te.Name or "",
-                        "DefaultCode": host.LookupParameter("Comments").AsString()
-                        or "",
-                        "NewCode": row.Cells["NewCode"].Value,
-                        "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                        "Length": row.Cells["Length"].Value,
-                        "Size": "",
-                        "GEB_Article_Number": "",
-                        "TagStatus": "Yes",
-                    }
-                    self._add_row(data)
-
-            elif val == "Remove Tag":
-                host_eid = host.Id.IntegerValue
-                deleted_id = None
-                tag_elem_id = None
-                for t in (
-                    FilteredElementCollector(doc)
-                    .OfCategory(BuiltInCategory.OST_PipeTags)
-                    .WhereElementIsNotElementType()
-                    .ToElements()
-                ):
-                    tagged = (
-                        t.GetTaggedElementIds()
-                        if hasattr(t, "GetTaggedElementIds")
-                        else [t.TaggedElementId]
-                    )
-                    for rid in tagged:
-                        eid = (
-                            rid.HostElementId.IntegerValue
-                            if hasattr(rid, "HostElementId")
-                            else rid.IntegerValue
-                        )
-                        if eid == host_eid:
-                            deleted_id = t.Id.IntegerValue
-                            tag_elem_id = t.Id
-                            break
-                    if deleted_id:
-                        break
-                if deleted_id:
-                    self.dataGrid.SelectionChanged -= self.on_row_selected
-                    tr = Transaction(doc, "Remove Tag")
-                    tr.Start()
-                    doc.Delete(tag_elem_id)
-                    tr.Commit()
-                    row.Cells["TagStatus"].Value = "Add/Place Tag"
-                    row.Cells["TagStatus"].ReadOnly = False
-                    for i in range(self.dataGrid.Rows.Count):
-                        r2 = self.dataGrid.Rows[i]
-                        if (
-                            r2.Cells["Category"].Value == "Pipe Tags"
-                            and int(str(r2.Cells["Id"].Value)) == deleted_id
-                        ):
-                            self.dataGrid.Rows.RemoveAt(i)
-                            break
-                    self.dataGrid.SelectionChanged += self.on_row_selected
-
-    # Smart dynamic spacing
-    def rearrange_buttons(self, sender, event):
-        controls = list(self.buttonPanel.Controls)
-        total_width = sum(c.Width for c in controls)
-        available = self.buttonPanel.Width - total_width
-        spacing = max(10, available // (len(controls) + 1))
-        x = spacing
-        for ctrl in controls:
-            ctrl.Location = Point(x, (self.buttonPanel.Height - ctrl.Height) // 2)
-            x += ctrl.Width + spacing
-
-    def _add_row(self, data):
-        """Helper to append a new DataGridView row from a dict."""
-        idx = self.dataGrid.Rows.Add()
-        row = self.dataGrid.Rows[idx]
-        for k, v in data.items():
-            row.Cells[k].Value = v
-
-        # Start with default
-        row.Cells["TagStatus"].Value = "Remove Tag"
-        row.Cells["TagStatus"].ReadOnly = True
-
-        # Try to identify reducer buttons
-        try:
-            cat = data.get("Category", "")
-            eid = int(data.get("Id", "0"))
-            elem = doc.GetElement(ElementId(eid))
-
-            if cat == "Pipe Fittings" and isinstance(elem, FamilyInstance):
-                fam_name = elem.Symbol.Family.Name.lower()
-                debug("✅ Family name:", fam_name)
-
-                if "multireducer_geb" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip Reducer"
-                    row.Cells["TagStatus"].ReadOnly = False
-
-                elif "multibocht" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip 2x45°"
-                    row.Cells["TagStatus"].ReadOnly = False
-
-                elif "liggend" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip T-stuk"
-                    row.Cells["TagStatus"].ReadOnly = False
-
-        except Exception as ex:
-            debug("⚠️ Error resolving Flip button logic:", ex)
-
-    def btnPlaceTextNote_Click(self, sender, event):
-        text_note_code = self.txtTextNoteCode.Text.strip()
-        if text_note_code == "":
-            MessageBox.Show("Please enter a Text Note Code.", "Error")
-            return
-        if not self.regionElements or len(self.regionElements) == 0:
-            MessageBox.Show(
-                "Region elements not available to compute location.", "Error"
-            )
-            return
-        (region_min, region_max) = get_region_bounding_box(self.regionElements)
-        corner = region_min
-        ttn = Transaction(doc, "Place Text Note")
-        ttn.Start()
-        note_type = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-        if note_type:
-            opts = TextNoteOptions(note_type.Id)
-            new_note = TextNote.Create(
-                doc, doc.ActiveView.Id, corner, text_note_code, opts
-            )
-            if new_note:
-                MessageBox.Show("Text Note created successfully.", "Success")
-                self.textNotePlaced = True
-        else:
-            MessageBox.Show("No TextNoteType found.", "Error")
-        ttn.Commit()
-
-    def autoFillPipeTagCodes(self, sender, event):
-        # 1) Parse base
+    def autoFillPipeTagCodes(self, sender, e):
         raw = self.txtTextNoteCode.Text.strip()
         m = re.search(r"([\d\.]+)", raw)
         if not m:
             MessageBox.Show("Could not parse base code from text note.", "Error")
             return
-        base = m.group(1)  # e.g. "4.1.1"
+        base = m.group(1)
 
-        # 2) (optional) keep prefix/base_n split if you want for pipes
-        parts = base.split(".")
-        if len(parts) >= 3:
-            prefix = parts[0] + "." + parts[1]  # "4.1"
-            try:
-                base_n = int(parts[2])  # 1
-            except:
-                base_n = 0
-        else:
-            prefix, base_n = base, 0
-
-        # 2) Collect indices
-        fit_rows, pipe_rows, tag_rows = [], [], []
+        pipe_rows, fit_rows, tag_rows = [], [], []
         for i in range(self.dataGrid.Rows.Count):
             cat = self.dataGrid.Rows[i].Cells["Category"].Value
-            if cat == "Pipe Fittings":
-                fit_rows.append(i)
-            elif cat == "Pipes":
+            if cat == "Pipes":
                 pipe_rows.append(i)
+            elif cat == "Pipe Fittings":
+                fit_rows.append(i)
             elif cat == "Pipe Tags":
                 tag_rows.append(i)
 
-        # Override all Pipe Fittings rows to the base code
-        for idx in fit_rows:
-            self.dataGrid.Rows[idx].Cells["NewCode"].Value = base
+        # fittings = base
+        for i in fit_rows:
+            self.dataGrid.Rows[i].Cells["NewCode"].Value = base
 
-        # 5) Pipes sorted and numbered: full base + .1,.2...
-        pipe_centers = []
-        for idx in pipe_rows:
-            rid = safe_int(self.dataGrid.Rows[idx].Cells["Id"].Value)
+        # pipes numbered by X,Y
+        entries = []
+        for i in pipe_rows:
+            rid = safe_int(self.dataGrid.Rows[i].Cells["Id"].Value)
             elem = doc.GetElement(ElementId(rid))
-            bbox = elem.get_BoundingBox(uidoc.ActiveView)
-            if bbox:
-                ctr = XYZ(
-                    (bbox.Min.X + bbox.Max.X) * 0.5,
-                    (bbox.Min.Y + bbox.Max.Y) * 0.5,
-                    (bbox.Min.Z + bbox.Max.Z) * 0.5,
+            bb = elem.get_BoundingBox(uidoc.ActiveView) if elem else None
+            ctr = (
+                XYZ(
+                    (bb.Min.X + bb.Max.X) * 0.5,
+                    (bb.Min.Y + bb.Max.Y) * 0.5,
+                    (bb.Min.Z + bb.Max.Z) * 0.5,
                 )
-            else:
-                ctr = XYZ(0, 0, 0)
-            pipe_centers.append((idx, ctr))
+                if bb
+                else XYZ(0, 0, 0)
+            )
+            entries.append((i, ctr))
+        entries.sort(key=lambda x: (x[1].X, x[1].Y))
+        for n, (i, _) in enumerate(entries, 1):
+            self.dataGrid.Rows[i].Cells["NewCode"].Value = "{}.{}".format(base, n)
 
-        pipe_centers.sort(key=lambda x: (x[1].X, x[1].Y))
-        for i, (idx, _) in enumerate(pipe_centers, 1):
-            self.dataGrid.Rows[idx].Cells["NewCode"].Value = "{}.{}".format(base, i)
-
-        # 6) Mirror pipe numbering onto pipe‐tag rows (same count)
-        for i, _ in enumerate(pipe_centers, 1):
-            if i - 1 < len(tag_rows):
-                trow = tag_rows[i - 1]
-                self.dataGrid.Rows[trow].Cells["NewCode"].Value = "{}.{}".format(
-                    base, i
-                )
+        # mirror to tag rows (count-limited)
+        for n in range(1, len(entries) + 1):
+            if n - 1 < len(tag_rows):
+                tr = tag_rows[n - 1]
+                self.dataGrid.Rows[tr].Cells["NewCode"].Value = "{}.{}".format(base, n)
 
     def dataGrid_CellContentClick(self, sender, e):
-        col = self.dataGrid.Columns[e.ColumnIndex].Name
-        if col != "TagStatus":
+        # Only handle basic Pipe Tag add/remove here (leaderless); no fitting flips in safe-mode
+        if self.dataGrid.Columns[e.ColumnIndex].Name != "TagStatus":
+            return
+        row = self.dataGrid.Rows[e.RowIndex]
+        cat = row.Cells["Category"].Value
+        val = row.Cells["TagStatus"].Value
+        if cat != "Pipes":
             return
 
-        # Always include the clicked row
-        clicked_row = self.dataGrid.Rows[e.RowIndex]
-        selected_indexes = {r.Index for r in self.dataGrid.SelectedRows if r.Index >= 0}
-        selected_indexes.add(clicked_row.Index)
+        host_id = safe_int(row.Cells["Id"].Value)
+        host = doc.GetElement(ElementId(host_id))
+        if not host:
+            return
 
-        # Build selected rows list from indexes
-        selected_rows = [self.dataGrid.Rows[i] for i in selected_indexes]
-
-        for row in selected_rows:
-            cat = row.Cells["Category"].Value
-            val = row.Cells["TagStatus"].Value
-
-            if cat == "Pipe Fittings" and val == "Flip T-stuk":
+        if val == "Add/Place Tag":
+            with Transaction(doc, "Add Tag (safe)") as tr:
+                tr.Start()
+                bb = host.get_BoundingBox(uidoc.ActiveView)
+                if bb:
+                    ctr = XYZ(
+                        (bb.Min.X + bb.Max.X) * 0.5,
+                        (bb.Min.Y + bb.Max.Y) * 0.5,
+                        (bb.Min.Z + bb.Max.Z) * 0.5,
+                    )
+                    IndependentTag.Create(
+                        doc,
+                        doc.ActiveView.Id,
+                        Reference(host),
+                        SAFE_CFG["tag_use_leader"],
+                        TagMode.TM_ADDBY_CATEGORY,
+                        TagOrientation.Horizontal,
+                        ctr,
+                    )
+                tr.Commit()
+            row.Cells["TagStatus"].Value = "Remove Tag"
+        elif val == "Remove Tag":
+            # remove any tag in active view pointing to this host
+            tag_to_delete = None
+            for t in (
+                FilteredElementCollector(doc, uidoc.ActiveView.Id)
+                .OfCategory(BuiltInCategory.OST_PipeTags)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            ):
                 try:
-                    host_id = safe_int(row.Cells["Id"].Value)
-                    elem = doc.GetElement(ElementId(host_id))
-                    if elem:
-                        p = elem.LookupParameter("switch_excentriciteit")
-                        if p and p.StorageType == StorageType.Integer:
-                            current = p.AsInteger()
-                            t = Transaction(doc, "Flip T-stuk (switch_excentriciteit)")
-                            t.Start()
-                            p.Set(0 if current == 1 else 1)
-                            t.Commit()
-                            debug(
-                                "🔄 Flipped T-stuk (switch_excentriciteit = %s): %s"
-                                % (str(not current), str(elem.Id))
-                            )
-                except Exception as ex:
-                    debug("❌ Failed to flip T-stuk using switch_excentriciteit:", ex)
-
-            elif cat == "Pipe Fittings" and val == "Flip 2x45°":
-                try:
-                    host_id = safe_int(row.Cells["Id"].Value)
-                    elem = doc.GetElement(ElementId(host_id))
-                    if elem:
-                        param = elem.LookupParameter("2x45°")
-                        if param and param.StorageType == StorageType.Integer:
-                            current_val = param.AsInteger()
-
-                            t = Transaction(doc, "Toggle 2x45°")
-                            t.Start()
-                            param.Set(0 if current_val == 1 else 1)
-                            t.Commit()
-
-                            if current_val == 1:
-                                row.Cells["Bend45"].Value = "No"
-                            else:
-                                row.Cells["Bend45"].Value = "Yes"
-
-                            debug(
-                                "✅ Toggled 2x45° to",
-                                "OFF" if current_val == 1 else "ON",
-                                "for:",
-                                host_id,
-                            )
-                        else:
-                            debug(
-                                "⚠️ Parameter '2x45°' not found or not boolean:", host_id
-                            )
-                    else:
-                        debug("⚠️ Could not get element from ID:", host_id)
-                except Exception as ex:
-                    debug("❌ Failed to flip 2x45°:", ex)
-
-            elif cat == "Pipe Fittings" and val == "Flip Reducer":
-                try:
-                    host_id = safe_int(row.Cells["Id"].Value)
-                    elem = doc.GetElement(ElementId(host_id))
-
-                    if elem and isinstance(elem, FamilyInstance):
-                        name = row.Cells["Name"].Value or ""
-                        family_name = elem.Symbol.Family.Name.lower()
-
-                        if "multireducer_geb" in family_name:
-                            reducer_param = elem.LookupParameter("reducer_eccentric")
-                            if (
-                                reducer_param
-                                and reducer_param.StorageType == StorageType.Integer
-                            ):
-                                current_val = reducer_param.AsInteger()
-
-                                t = Transaction(doc, "Toggle reducer_eccentric")
-                                t.Start()
-                                reducer_param.Set(0 if current_val == 1 else 1)
-                                t.Commit()
-
-                                debug(
-                                    "✅ Toggled reducer_eccentric to",
-                                    "OFF" if current_val == 1 else "ON",
-                                    "for:",
-                                    host_id,
-                                )
-                except Exception as ex:
-                    debug("❌ Failed to toggle redcuer_eccentric:", ex)
-
-            # ----------------------
-            # ADD/REMOVE TAG (Pipes)
-            # ----------------------
-            elif cat == "Pipes":
-                host_id = safe_int(row.Cells["Id"].Value)
-                host = doc.GetElement(ElementId(host_id))
-
-                if val == "Add/Place Tag":
-                    tr = Transaction(doc, "Add Tag")
-                    tr.Start()
-                    bb = host.get_BoundingBox(uidoc.ActiveView)
-                    if bb:
-                        ctr = XYZ(
-                            (bb.Min.X + bb.Max.X) / 2.0,
-                            (bb.Min.Y + bb.Max.Y) / 2.0,
-                            (bb.Min.Z + bb.Max.Z) / 2.0,
-                        )
-                        ref = Reference(host)
-                        new_tag = IndependentTag.Create(
-                            doc,
-                            doc.ActiveView.Id,
-                            ref,
-                            True,
-                            TagMode.TM_ADDBY_CATEGORY,
-                            TagOrientation.Horizontal,
-                            ctr,
-                        )
-                    tr.Commit()
-
-                    row.Cells["TagStatus"].Value = "Remove Tag"
-
-                    # Add new Pipe Tag row
-                    te = doc.GetElement(new_tag.Id)
-                    if te:
-                        data = {
-                            "Id": str(te.Id),
-                            "Category": "Pipe Tags",
-                            "Name": te.Name or "",
-                            "DefaultCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "NewCode": row.Cells["NewCode"].Value,
-                            "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                            "Length": row.Cells["Length"].Value,
-                            "Size": "",
-                            "GEB_Article_Number": "",
-                            "TagStatus": "Yes",
-                        }
-                        self._add_row(data)
-
-                elif val == "Remove Tag":
-                    host_eid = host.Id.IntegerValue
-                    deleted_id = None
-                    tag_elem_id = None
-                    for t in (
-                        FilteredElementCollector(doc)
-                        .OfCategory(BuiltInCategory.OST_PipeTags)
-                        .WhereElementIsNotElementType()
-                        .ToElements()
-                    ):
-                        tagged = (
-                            t.GetTaggedElementIds()
-                            if hasattr(t, "GetTaggedElementIds")
-                            else [t.TaggedElementId]
-                        )
-                        for rid in tagged:
-                            eid = (
-                                rid.HostElementId.IntegerValue
+                    if hasattr(t, "GetTaggedElementIds"):
+                        ids = t.GetTaggedElementIds()
+                        for rid in ids:
+                            hid = (
+                                rid.HostElementId
                                 if hasattr(rid, "HostElementId")
-                                else rid.IntegerValue
+                                else rid
                             )
-                            if eid == host_eid:
-                                deleted_id = t.Id.IntegerValue
-                                tag_elem_id = t.Id
+                            if hid.IntegerValue == host.Id.IntegerValue:
+                                tag_to_delete = t.Id
                                 break
-                        if deleted_id:
-                            break
-                    if deleted_id:
-                        self.dataGrid.SelectionChanged -= self.on_row_selected
-                        tr = Transaction(doc, "Remove Tag")
-                        tr.Start()
-                        doc.Delete(tag_elem_id)
-                        tr.Commit()
-                        row.Cells["TagStatus"].Value = "Add/Place Tag"
-                        row.Cells["TagStatus"].ReadOnly = False
-                        for i in range(self.dataGrid.Rows.Count):
-                            r2 = self.dataGrid.Rows[i]
-                            if (
-                                r2.Cells["Category"].Value == "Pipe Tags"
-                                and int(str(r2.Cells["Id"].Value)) == deleted_id
-                            ):
-                                self.dataGrid.Rows.RemoveAt(i)
-                                break
-                        self.dataGrid.SelectionChanged += self.on_row_selected
+                    elif hasattr(t, "TaggedElementId") and t.TaggedElementId:
+                        if t.TaggedElementId.IntegerValue == host.Id.IntegerValue:
+                            tag_to_delete = t.Id
+                except:
+                    pass
+                if tag_to_delete:
+                    break
 
-            # --------------------------
-            # REMOVE TAG (Pipe Tags)
-            # --------------------------
-            elif cat == "Pipe Tags" and val == "Remove Tag":
-                tag_id = ElementId(safe_int(row.Cells["Id"].Value))
-                self.dataGrid.SelectionChanged -= self.on_row_selected
-                try:
-                    tag_elem = doc.GetElement(tag_id)
-                    host_id = None
-                    if tag_elem:
-                        ids = (
-                            tag_elem.GetTaggedElementIds()
-                            if hasattr(tag_elem, "GetTaggedElementIds")
-                            else [tag_elem.TaggedElementId]
-                        )
-                        if ids and len(ids):
-                            rid = ids[0]
-                            host_id = (
-                                rid.HostElementId.IntegerValue
-                                if hasattr(rid, "HostElementId")
-                                else rid.IntegerValue
-                            )
-
-                    tr = Transaction(doc, "Remove Pipe-Tag")
+            if tag_to_delete:
+                with Transaction(doc, "Remove Tag (safe)") as tr:
                     tr.Start()
-                    doc.Delete(tag_id)
+                    doc.Delete(tag_to_delete)
                     tr.Commit()
+                row.Cells["TagStatus"].Value = "Add/Place Tag"
 
-                    self.dataGrid.Rows.RemoveAt(row.Index)
-
-                    if host_id:
-                        for i in range(self.dataGrid.Rows.Count):
-                            pr = self.dataGrid.Rows[i]
-                            if (
-                                int(str(pr.Cells["Id"].Value)) == host_id
-                                and pr.Cells["Category"].Value == "Pipes"
-                            ):
-                                pr.Cells["TagStatus"].Value = "Add/Place Tag"
-                                pr.Cells["TagStatus"].ReadOnly = False
-                                break
-                finally:
-                    self.dataGrid.SelectionChanged += self.on_row_selected
-
-    def okButton_Click(self, sender, event):
-        updated_data = []
-        for row in self.dataGrid.Rows:
-            entry = {
-                "Id": row.Cells["Id"].Value,
-                "Category": row.Cells["Category"].Value,
-                "Name": row.Cells["Name"].Value,
-                "DefaultCode": row.Cells["DefaultCode"].Value,
-                "NewCode": row.Cells["NewCode"].Value,
-                "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                "Length": row.Cells["Length"].Value,
-                "TagStatus": row.Cells["TagStatus"].Value,
-            }
-            updated_data.append(entry)
-
+    def okButton_Click(self, sender, e):
+        updated = []
+        for r in self.dataGrid.Rows:
+            updated.append(
+                {
+                    "Id": r.Cells["Id"].Value,
+                    "Category": r.Cells["Category"].Value,
+                    "Name": r.Cells["Name"].Value,
+                    "DefaultCode": r.Cells["DefaultCode"].Value,
+                    "NewCode": r.Cells["NewCode"].Value,
+                }
+            )
         self.Result = {
-            "Elements": updated_data,
+            "Elements": updated,
             "TextNotePlaced": self.textNotePlaced,
             "TextNote": self.txtTextNoteCode.Text.strip(),
         }
         self.DialogResult = DialogResult.OK
         self.Close()
 
-    def on_row_selected(self, sender, event):
-        """When the user clicks or arrows to a row, select that element in Revit."""
+    def _cancel(self, sender, e):
+        self.Result = None
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+    def on_row_selected(self, sender, e):
         row = self.dataGrid.CurrentRow
         if not row:
             return
         id_val = row.Cells["Id"].Value
         if not id_val:
             return
-
-        # try to parse and highlight, but swallow any invalid-object errors
         try:
             eid = ElementId(int(str(id_val)))
             elem = doc.GetElement(eid)
-            # guard against deleted/invalid elements
             if elem and elem.IsValidObject:
                 uidoc.Selection.SetElementIds(List[ElementId]([eid]))
         except:
@@ -1404,37 +598,28 @@ class ElementEditorForm(Form):
 
 
 def show_element_editor(elements_data, region_elements=None):
-    form = ElementEditorForm(elements_data, region_elements)
-    if form.ShowDialog() == DialogResult.OK:
-        return form.Result
-    return None
+    f = ElementEditorForm(elements_data, region_elements)
+    return f.ShowDialog() == DialogResult.OK and f.Result or None
 
 
 # ==================================================
-# Filter Gathered Elements to Relevant Categories
+# Filtering for relevant elements
 # ==================================================
 def filter_relevant_elements(gathered_elements):
-    """
-    Build a list of dicts with keys:
-     "Id","Category","Name","DefaultCode","NewCode",
-     "OutsideDiameter","Length","GEB_Article_Number","TagStatus"
-    """
     relevant = []
-
-    pipe_ids = {
-        e.Id.IntegerValue
-        for e in gathered_elements
-        if e.Category and e.Category.Name == "Pipes"
-    }
-    # grab all tags in the view
     all_pipe_tags = (
         FilteredElementCollector(doc)
         .OfCategory(BuiltInCategory.OST_PipeTags)
         .WhereElementIsNotElementType()
         .ToElements()
     )
+    pipe_ids = {
+        e.Id.IntegerValue
+        for e in gathered_elements
+        if e.Category and e.Category.Name == "Pipes"
+    }
 
-    # pull in any tags whose host pipe was in our region
+    # include any pipe tags whose hosts are in region
     for tag in all_pipe_tags:
         try:
             host = None
@@ -1449,33 +634,40 @@ def filter_relevant_elements(gathered_elements):
             elif hasattr(tag, "TaggedElementId"):
                 host = doc.GetElement(tag.TaggedElementId)
             if host and host.Id.IntegerValue in pipe_ids:
-                # and only if we haven't already added it in gathered_elements
-                if not any(str(tag.Id) == d["Id"] for d in relevant):
-                    warning_val = ""
-                    bend45_val = ""
-                    # build your dict exactly like you do for pipe‑tags below
-                    relevant.append(
-                        {
-                            "Id": str(tag.Id),
-                            "Category": "Pipe Tags",
-                            "Name": tag.Name or "",
-                            "Warning": "",
-                            "Bend45": "",
-                            "DefaultCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "NewCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "OutsideDiameter": convert_param_to_string(
+                relevant.append(
+                    {
+                        "Id": str(tag.Id),
+                        "Category": "Pipe Tags",
+                        "Name": tag.Name or "",
+                        "Warning": "",
+                        "Bend45": "",
+                        "DefaultCode": (
+                            (host.LookupParameter("Comments").AsString() or "")
+                            if host
+                            else ""
+                        ),
+                        "NewCode": (
+                            (host.LookupParameter("Comments").AsString() or "")
+                            if host
+                            else ""
+                        ),
+                        "OutsideDiameter": (
+                            convert_param_to_string(
                                 host.LookupParameter("Outside Diameter")
-                            ),
-                            "Length": convert_param_to_string(
-                                host.LookupParameter("Length")
-                            ),
-                            "Size": "",  # if you want
-                            "GEB_Article_Number": "",
-                            "TagStatus": "Yes",
-                        }
-                    )
+                            )
+                            if host
+                            else ""
+                        ),
+                        "Length": (
+                            convert_param_to_string(host.LookupParameter("Length"))
+                            if host
+                            else ""
+                        ),
+                        "Size": "",
+                        "GEB_Article_Number": "",
+                        "TagStatus": "Yes",
+                    }
+                )
         except:
             pass
 
@@ -1489,74 +681,57 @@ def filter_relevant_elements(gathered_elements):
         com = e.LookupParameter("Comments")
         default_code = com.AsString() if com and com.AsString() else ""
 
-        # initialize
         warning_val = ""
         bend45_val = ""
         outside_diam = ""
         length_val = ""
         art_num = ""
         tag_status = ""
-        size_val = ""
 
-        # --- Pipes ---
         if cat == "Pipes":
             odp = e.LookupParameter("Outside Diameter")
             lp = e.LookupParameter("Length")
             outside_diam = convert_param_to_string(odp)
             length_val = convert_param_to_string(lp)
 
-            # detect existing tags
             tag_status = "No"
             for tag in all_pipe_tags:
                 try:
                     if hasattr(tag, "GetTaggedElementIds"):
-                        refs = tag.GetTaggedElementIds()
-                        for rid in refs:
+                        for rid in tag.GetTaggedElementIds():
                             eid = (
-                                rid.HostElementId.IntegerValue
+                                rid.HostElementId
                                 if hasattr(rid, "HostElementId")
-                                else rid.IntegerValue
+                                else rid
                             )
-                            if eid == e.Id.IntegerValue:
+                            if eid.IntegerValue == e.Id.IntegerValue:
                                 tag_status = "Yes"
                                 break
-                    elif hasattr(tag, "TaggedElementId"):
+                    elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
                         if tag.TaggedElementId.IntegerValue == e.Id.IntegerValue:
                             tag_status = "Yes"
-                    if tag_status == "Yes":
-                        break
                 except:
                     pass
+                if tag_status == "Yes":
+                    break
 
-        # --- Pipe Fittings ---
         elif cat == "Pipe Fittings":
             p_warn = e.LookupParameter("waarschuwing")
             warning_val = p_warn.AsString() if p_warn else ""
-
             p_bend = e.LookupParameter("2x45°")
-            bend45_val = ""
             if p_bend and p_bend.StorageType == StorageType.Integer:
                 bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
-            # diameter (try several names)
             for pname in ("Outside Diameter", "Diameter", "Nominal Diameter"):
                 p = e.LookupParameter(pname)
                 if p:
                     outside_diam = convert_param_to_string(p)
                     break
-            # length
             lp = e.LookupParameter("Length")
             length_val = convert_param_to_string(lp)
-            # GEB article
             ap = e.LookupParameter("GEB_Article_Number")
-            art_num = ap.AsString() if ap and ap.AsString() else ""
+            art_num = ap.AsString() if (ap and ap.AsString()) else ""
+            tag_status = ""  # fittings not tagged here in safe-mode
 
-            # only the specific fitting gets Add/Place Tag
-            if e.Name and e.Name.find("DN") >= 0:
-                tag_status = "No"
-            else:
-                tag_status = ""
-
-        # --- Pipe Tags ---
         elif cat == "Pipe Tags":
             tag_status = "Yes"
             host = None
@@ -1573,22 +748,11 @@ def filter_relevant_elements(gathered_elements):
                     host = doc.GetElement(e.TaggedElementId)
             except:
                 host = None
-
             if host:
-                odp = host.LookupParameter("Outside Diameter")
-                lp = host.LookupParameter("Length")
-                outside_diam = convert_param_to_string(odp)
-                length_val = convert_param_to_string(lp)
-
-        # --- Text Notes & others ---
-        else:
-            tag_status = ""
-
-        size_val = ""
-        if cat == "Pipe Fittings":
-            param_size = e.LookupParameter("Size")
-            if param_size:
-                size_val = convert_param_to_string(param_size)
+                outside_diam = convert_param_to_string(
+                    host.LookupParameter("Outside Diameter")
+                )
+                length_val = convert_param_to_string(host.LookupParameter("Length"))
 
         relevant.append(
             {
@@ -1601,188 +765,250 @@ def filter_relevant_elements(gathered_elements):
                 "NewCode": default_code,
                 "OutsideDiameter": outside_diam,
                 "Length": length_val,
-                "Size": size_val,
+                "Size": "",
                 "GEB_Article_Number": art_num,
                 "TagStatus": tag_status,
             }
         )
-
     return relevant
 
 
 # ==================================================
-# MAIN WORKFLOW
+# Tagging helpers (leaderless, single transaction)
 # ==================================================
-gathered_elements = select_boundary_and_gather()
-if gathered_elements is None or len(gathered_elements) == 0:
-    MessageBox.Show("No elements were gathered. Operation cancelled.", "Error")
-    sys.exit("Operation cancelled by the user.")
+def _midpoint_or_center(elem, view):
+    try:
+        loc = getattr(elem, "Location", None)
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            return loc.Curve.Evaluate(0.5, True)
+    except:
+        pass
+    bb = elem.get_BoundingBox(view)
+    if not bb:
+        return XYZ(0, 0, 0)
+    return XYZ(
+        (bb.Min.X + bb.Max.X) / 2.0,
+        (bb.Min.Y + bb.Max.Y) / 2.0,
+        (bb.Min.Z + bb.Max.Z) / 2.0,
+    )
 
-filtered_elements = filter_relevant_elements(gathered_elements)
-if len(filtered_elements) == 0:
-    MessageBox.Show("No relevant elements found in the selected region.", "Error")
-    sys.exit("Operation cancelled by the user.")
 
-result = show_element_editor(filtered_elements, region_elements=gathered_elements)
+def get_untagged_pipes_in_view(doc, view):
+    pipes = list(
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeCurves)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    tagged = set()
+    for t in (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    ):
+        try:
+            if hasattr(t, "GetTaggedElementIds"):
+                for rid in t.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    tagged.add(hid.IntegerValue)
+            elif hasattr(t, "TaggedElementId") and t.TaggedElementId:
+                tagged.add(t.TaggedElementId.IntegerValue)
+        except:
+            pass
+    return [p for p in pipes if p.Id.IntegerValue not in tagged]
+
+
+def auto_tag_pipes_in_view(doc, view, use_leader=False):
+    untagged = get_untagged_pipes_in_view(doc, view)
+    if not untagged:
+        return 0
+    created = 0
+    with Transaction(doc, "Auto-tag pipes (safe)") as t:
+        t.Start()
+        for p in untagged:
+            try:
+                pt = _midpoint_or_center(p, view)
+                IndependentTag.Create(
+                    doc,
+                    view.Id,
+                    Reference(p),
+                    use_leader,
+                    TagMode.TM_ADDBY_CATEGORY,
+                    TagOrientation.Horizontal,
+                    pt,
+                )
+                created += 1
+            except:
+                continue
+        t.Commit()
+    return created
+
+
+# ==================================================
+# MAIN
+# ==================================================
+gathered_elements, polygon = select_boundary_and_gather()
+if not gathered_elements:
+    MessageBox.Show("No elements were gathered. Cancelled.", "Error")
+    sys.exit("Cancelled")
+
+filtered = filter_relevant_elements(gathered_elements)
+if not filtered:
+    MessageBox.Show("No relevant elements found in region.", "Error")
+    sys.exit("Cancelled")
+
+result = show_element_editor(filtered, region_elements=gathered_elements)
 if result is None:
-    sys.exit("Operation cancelled by the user.")
+    sys.exit("Cancelled")
 
 uidoc.Selection.SetElementIds(List[ElementId]())
 
+# Force fittings to base
 baseCode = result["TextNote"]
 for eData in result["Elements"]:
     if eData["Category"] == "Pipe Fittings":
         eData["NewCode"] = baseCode
 
-# --- Renumber Pipes based on region order (sorted left-to-right, bottom-to-up) ---
+# Renumber pipes if no placed text note
 if not result.get("TextNotePlaced", False):
-    base_raw = result.get("TextNote", "").strip()
+    base_raw = (result.get("TextNote", "") or "").strip()
     m = re.search(r"([\d\.]+)", base_raw)
     base = m.group(1) if m else "0"
-
     pipe_entries = []
     for idx, eData in enumerate(result["Elements"]):
         if eData["Category"] == "Pipes":
             elem = doc.GetElement(ElementId(int(str(eData["Id"]))))
             if elem:
-                bbox = elem.get_BoundingBox(uidoc.ActiveView)
-                if bbox:
+                bb = elem.get_BoundingBox(uidoc.ActiveView)
+                if bb:
                     center = XYZ(
-                        (bbox.Min.X + bbox.Max.X) / 2.0,
-                        (bbox.Min.Y + bbox.Max.Y) / 2.0,
-                        (bbox.Min.Z + bbox.Max.Z) / 2.0,
+                        (bb.Min.X + bb.Max.X) / 2.0,
+                        (bb.Min.Y + bb.Max.Y) / 2.0,
+                        (bb.Min.Z + bb.Max.Z) / 2.0,
                     )
                     pipe_entries.append((idx, center))
     pipe_entries.sort(key=lambda x: (x[1].X, x[1].Y))
-
     ctr = 1
     for i, _ in pipe_entries:
         result["Elements"][i]["NewCode"] = base + "." + str(ctr)
         ctr += 1
-
     for eData in result["Elements"]:
         if eData["Category"] == "Pipe Fittings":
             eData["NewCode"] = base
 
-# --- Update the elements' "Comments" from the DataGridView ---
-t = Transaction(doc, "Update Comments")
-t.Start()
-for eData in result["Elements"]:
-    # skip rows where Id is missing or not an integer
-    id_val = eData.get("Id")
-    try:
-        eid = int(str(id_val))
-    except (TypeError, ValueError):
-        continue
+# Update Comments
+with Transaction(doc, "Update Comments (safe)") as t:
+    t.Start()
+    for eData in result["Elements"]:
+        id_val = eData.get("Id")
+        try:
+            eid = int(str(id_val))
+        except:
+            continue
+        elem = doc.GetElement(ElementId(eid))
+        if not elem:
+            continue
+        p = elem.LookupParameter("Comments")
+        if not p or p.IsReadOnly:
+            continue
+        if eData["Category"] == "Pipe Fittings":
+            p.Set(result["TextNote"])
+        else:
+            p.Set(str(eData["NewCode"]))
+    t.Commit()
 
-    elem = doc.GetElement(ElementId(eid))
-    if not elem:
-        continue
-    # get the Comments parameter
-    p = elem.LookupParameter("Comments")
-    if not p or p.IsReadOnly:
-        continue
-
-    # if this is a fitting, force it to the base sheet code
-    if eData["Category"] == "Pipe Fittings":
-        # result ["TextNote"] holds exactly the text you placed e.g. "5.1.1"
-        p.Set(result["TextNote"])
-    else:
-        # pipes & tags keep their full NewCode
-        p.Set(str(eData["NewCode"]))
-t.Commit()
-
-# --- Place the text note if not already placed ---
-if not result.get("TextNotePlaced", False):
-    (region_min, region_max) = get_region_bounding_box(gathered_elements)
-    view = doc.ActiveView
-    corner = region_min
-    ttn = Transaction(doc, "Place Text Note at Region Corner")
-    ttn.Start()
-    nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-    if nt:
-        opts = TextNoteOptions(nt.Id)
-        TextNote.Create(
-            doc, doc.ActiveView.Id, corner, result.get("TextNote", base), opts
-        )
-    ttn.Commit()
-
-region_min, region_max = get_region_bounding_box(gathered_elements)
-
+# -------- Create cropped duplicate view (no detailing) --------
 orig = uidoc.ActiveView
 if orig.ViewType != ViewType.FloorPlan:
     MessageBox.Show("Active view is not a Floor Plan!", "Error")
     sys.exit()
 
-# grab the original crop box transform so the region maps to the same coordinate system
-orig_bb = orig.CropBox
-orig_trans = orig_bb.Transform
+# level Z for 3D box if ever needed
+if isinstance(orig, ViewPlan) and orig.GenLevel:
+    level_z = doc.GetElement(orig.GenLevel.Id).Elevation
+else:
+    level_z = 0.0
 
-tx = Transaction(doc, "Create Cropped Plan View")
-tx.Start()
-
-# Duplicate With Detailing so all your pipe-tags (Independent Tag) come over
-new_id = orig.Duplicate(ViewDuplicateOption.WithDetailing)
-new_view = doc.GetElement(new_id)
-
-# remove any view template and set scale to 1:50
-new_view.ViewTemplateId = ElementId.InvalidElementId
-
-# force it to Coordination
-new_view.Discipline = ViewDiscipline.Coordination
-new_view.Scale = 50
-
-# naming, cropping, discipline etc...
 m = re.search(r"([\d\.]+)", result["TextNote"])
-base = m.group(1) if m else result["TextNote"].strip()  # "5.1.1"
-try:
-    new_view.Name = base
-except ArgumentException:
-    MessageBox.Show(
-        "A view named '{0}' already exists!\n\n"
-        "Please pick a different code in the text-node editor.".format(base),
-        "Duplicate View Name",
-    )
-    tx.RollBack()
-    sys.exit("Duplicate View Name")
-# apply region crop using the same transform
-bb = BoundingBoxXYZ()
-bb.Min = region_min
-bb.Max = region_max
-bb.Transform = orig_trans
+base = m.group(1) if m else (result["TextNote"] or "").strip()
 
-new_view.CropBoxActive = True
-new_view.CropBoxVisible = True
-# new_view.CropBox = bb
+pminx, pminy, pmaxx, pmaxy = polygon_bounds_xy(polygon)
+orig_bb = orig.CropBox
 
-# turn on annotation crop
-annoParam = new_view.get_Parameter(BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE)
-if annoParam and not annoParam.IsReadOnly:
-    annoParam.Set(1)
+region_min = XYZ(min(pminx, pmaxx), min(pminy, pmaxy), orig_bb.Min.Z)
+region_max = XYZ(max(pminx, pmaxx), max(pminy, pmaxy), orig_bb.Max.Z)
 
-new_view.CropBox = bb
+dup_mode = (
+    ViewDuplicateOption.WithDetailing
+    if SAFE_CFG["duplicate_with_detailing"]
+    else ViewDuplicateOption.Duplicate
+)
 
-# Hide crop region controls (but keep border visible)
-param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
-if param and not param.IsReadOnly:
-    param.Set(0)
+with Transaction(doc, "Create Cropped Plan View (safe)") as tx:
+    tx.Start()
+    new_id = orig.Duplicate(dup_mode)
+    new_view = doc.GetElement(new_id)
 
-# Hide temporary blue dimensions
-# temp_dim_param = new_view.get_Parameter(BuiltInParameter.VIEWER_TEMP_DIM_VISIBLE)
-# if temp_dim_param and not temp_dim_param.IsReadOnly:
-#     temp_dim_param.Set(0)
+    # Detach from template and set light discipline/scale
+    new_view.ViewTemplateId = ElementId.InvalidElementId
+    new_view.Scale = SAFE_CFG["view_scale"]
+    try:
+        new_view.Discipline = getattr(ViewDiscipline, SAFE_CFG["view_discipline"])
+    except:
+        pass
 
-# Hide pipe drag handles (blue grip boxes)
-cat_drag_controls = doc.Settings.Categories.get_Item(BuiltInCategory.OST_ConnectorElem)
-if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
-    new_view.SetCategoryHidden(cat_drag_controls.Id, True)
+    try:
+        new_view.Name = base
+    except ArgumentException:
+        new_view.Name = "{} ({})".format(base, new_view.Id.IntegerValue)
 
-tx.Commit()
-# -----------------------------------------
-# 2) SHOW TITLE-BLOCK PICKER, THEN CREATE SHEET
-# -----------------------------------------
+    # Apply identity crop (no transform reuse)
+    bb = BoundingBoxXYZ()
+    bb.Min = region_min
+    bb.Max = region_max
+    new_view.CropBoxActive = True
+    new_view.CropBoxVisible = False  # always off in safe-mode
+    # Annotation crop OFF in safe-mode
+    annoParam = new_view.get_Parameter(BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE)
+    if annoParam and not annoParam.IsReadOnly:
+        annoParam.Set(1 if SAFE_CFG["annotation_crop_on"] else 0)
 
-# collect title‑blocks
+    new_view.CropBox = bb
+
+    # Tiny text note (optional)
+    if SAFE_CFG["place_text_note"]:
+        try:
+            nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+            if nt:
+                note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
+                TextNote.Create(
+                    doc,
+                    new_view.Id,
+                    note_pt,
+                    result.get("TextNote", ""),
+                    TextNoteOptions(nt.Id),
+                )
+        except:
+            pass
+
+    # Hide crop region controls if wanted
+    if SAFE_CFG["hide_crop_region_controls"]:
+        visParam = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
+        if visParam and not visParam.IsReadOnly:
+            visParam.Set(0)
+
+    tx.Commit()
+
+# Tag untagged pipes (leaderless, one transaction)
+if SAFE_CFG["autotag_pipes"]:
+    try:
+        auto_tag_pipes_in_view(doc, new_view, use_leader=SAFE_CFG["tag_use_leader"])
+    except:
+        pass
+
+# -------- Title-block picker & sheet creation (simple) --------
+# collect title-blocks
 all_tbs = list(
     FilteredElementCollector(doc)
     .OfCategory(BuiltInCategory.OST_TitleBlocks)
@@ -1791,19 +1017,17 @@ all_tbs = list(
 )
 
 if not all_tbs:
-    MessageBox.Show("No title‑block types found.", "Error")
+    MessageBox.Show("No title-block types found.", "Error")
     sys.exit()
 
 
 class TBPicker(Form):
     def __init__(self, tbs):
         self.tbs = tbs
-        self.Text = "Choose a Title‑Block"
-        self.ClientSize = Size(300, 350)
-
-        # ListBox
+        self.Text = "Choose a Title-Block"
+        self.ClientSize = Size(340, 360)
         self.lb = ListBox()
-        self.lb.Bounds = Rectangle(10, 10, 280, 280)
+        self.lb.Bounds = Rectangle(10, 10, 320, 300)
         for sym in tbs:
             fam = sym.Family.Name if sym.Family else ""
             type_name = (
@@ -1811,11 +1035,9 @@ class TBPicker(Form):
             )
             self.lb.Items.Add(fam + " - " + type_name)
         self.Controls.Add(self.lb)
-
-        # OK / Cancel
-        ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300))
+        ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 320))
         ca = Button(
-            Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 300)
+            Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 320)
         )
         self.Controls.Add(ok)
         self.Controls.Add(ca)
@@ -1826,281 +1048,45 @@ class TBPicker(Form):
 existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
 existing_numbers = {s.SheetNumber for s in existing_sheets}
 
-# show the picker
 picker = TBPicker(all_tbs)
 if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
     MessageBox.Show("Sheet creation cancelled.", "Info")
     sys.exit()
 
 title_block = all_tbs[picker.lb.SelectedIndex]
-
-# ————————————————————————————————
-# 3) Create A3 sheets, skipping duplicates
-# ————————————————————————————————
-sheet_code = base  # e.g. "5.1.1" parsed earlier for the new view name
-
+sheet_code = base
 if sheet_code in existing_numbers:
-    MessageBox.Show(
-        "Sheet 'prefab {0}' already exists!\n\n"
-        "Please pick a different code in the text-note editor.".format(sheet_code),
-        "Duplicate Sheet",
-    )
-    sys.exit("Duplicate sheet number")
+    sheet_code = "{} ({})".format(base, new_view.Id.IntegerValue)
 
-t3 = Transaction(doc, "Create sheet and 3D callout")
-t3.Start()
-
-sheet = ViewSheet.Create(doc, title_block.Id)
-sheet.SheetNumber = sheet_code
-sheet.Name = "Prefab " + sheet_code
-
-# Get placed title block instance and its bounding box
-titleblock_inst = next(
-    (
-        e
-        for e in FilteredElementCollector(doc, sheet.Id)
-        .OfClass(FamilyInstance)
-        .ToElements()
-        if e.Symbol.Id == title_block.Id
-    ),
-    None,
-)
-
-tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
-if not tb_bb:
-    MessageBox.Show("Could not retrieve title block bounding box.", "Error")
-    t3.RollBack()
-    sys.exit()
-
-# Center of the inner region of the title block
-tb_center = XYZ(
-    (tb_bb.Min.X + tb_bb.Max.X) / 2.0,
-    (tb_bb.Min.Y + tb_bb.Max.Y) / 2.0,
-    0,
-)
-
-# Place the main floor plan view centered in title block region
-Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
-# ---------- 3D view: create, crop to region, place on sheet ----------
-# find a 3D ViewFamilyType
-v3d_type = next(
-    (
-        v
-        for v in FilteredElementCollector(doc).OfClass(ViewFamilyType)
-        if v.ViewFamily == ViewFamily.ThreeDimensional
-    ),
-    None,
-)
-if v3d_type is None:
-    MessageBox.Show("No 3D ViewFamilyType found.", "Error")
-    t3.RollBack()
-    sys.exit()
-
-# make an isometric 3D view
-v3d = View3D.CreateIsometric(doc, v3d_type.Id)
-v3d.Name = "{} - 3D".format(sheet_code)  # e.g. 5.1.1 - 3D
-v3d.Scale = new_view.Scale
-v3d.Discipline = ViewDiscipline.Coordination
-
-# section box from the selected region (pad Z a bit)
-sb = BoundingBoxXYZ()
-sb.Min = XYZ(region_min.X, region_min.Y, region_min.Z - 10.0)  # ~10 ft down
-sb.Max = XYZ(region_max.X, region_max.Y, region_max.Z + 10.0)  # ~10 ft up
-v3d.SetSectionBox(sb)
-v3d.IsSectionBoxActive = True
-
-# place 3D viewport offset from plan
-Viewport.Create(doc, sheet.Id, v3d.Id, XYZ(tb_center.X + 0.35, tb_center.Y, 0))
-
-# ---------- Schedule: duplicate the right master (ACO/Geberit), filter by prefab code + level, place ----------
-sheet_code = sheet.SheetNumber  # e.g. "1.0.0"
-
-
-# sniff manufacturer from the selected region (prefer pipes & fittings)
-def detect_manufacturer(elems):
-    for e in elems:
-        try:
-            if not e.Category:
-                continue
-            if e.Category.Name not in ("Pipes", "Pipe Fittings"):
-                continue
-            p = e.LookupParameter("Manufacturer")
-            s = p.AsString() if p else None
-            if s:
-                s_up = s.strip().upper()
-                if "ACO" in s_up:
-                    return "ACO"
-                if "GEBERIT" in s_up:
-                    return "GEBERIT"
-        except:
-            pass
-    return None
-
-
-manufacturer_choice = (detect_manufacturer(gathered_elements) or "ACO").upper()
-
-# candidate master schedules (exact names from your Browser)
-aco_pipe_masters = [
-    "ACO pipe EPDM 1.4301 single socket first floor",
-]
-geberit_pipe_masters = [
-    "Geberit PE leidingen",
-]
-
-
-def find_first_by_names(schedules, names):
-    for nm in names:
-        s = next((x for x in schedules if (not x.IsTemplate) and x.Name == nm), None)
-        if s is not None:
-            return s
-    return None
-
-
-all_scheds = list(FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements())
-if manufacturer_choice == "GEBERIT":
-    master = find_first_by_names(
-        all_scheds, geberit_pipe_masters
-    ) or find_first_by_names(all_scheds, aco_pipe_masters)
-else:
-    master = find_first_by_names(all_scheds, aco_pipe_masters) or find_first_by_names(
-        all_scheds, geberit_pipe_masters
-    )
-
-# resolve the level name from the plan view you duplicated
-level_name = None
+# Ensure TB active
 try:
-    if isinstance(new_view, ViewPlan):
-        lvl = new_view.GenLevel
-        if lvl:
-            level_name = lvl.Name
+    if hasattr(title_block, "IsActive") and (not title_block.IsActive):
+        with Transaction(doc, "Activate title block") as t_act:
+            t_act.Start()
+            title_block.Activate()
+            t_act.Commit()
 except:
     pass
 
-if master:
-    t = Transaction(doc, "Duplicate & Configure Pipe Schedule")
-    t.Start()
+with Transaction(doc, "Create sheet & place plan (safe)") as t3:
+    t3.Start()
+    sheet = ViewSheet.Create(doc, title_block.Id)
+    sheet.SheetNumber = sheet_code
+    sheet.Name = "Prefab " + sheet_code
 
-    dup_id = master.Duplicate(ViewDuplicateOption.Duplicate)
-    vs = doc.GetElement(dup_id)
-    vs.Name = "{} {}".format(master.Name, sheet_code)
-
-    defn = vs.Definition
-
-    # ensure Comments field exists and get FieldId
-    comments_pid = ElementId(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-    cm_field_id = None
-    for i in range(defn.GetFieldCount()):
-        try:
-            f = defn.GetField(i)
-            if hasattr(f, "GetSchedulableField"):
-                sf = f.GetSchedulableField()
-                if sf and sf.ParameterId == comments_pid:
-                    cm_field_id = f.FieldId
-                    break
-        except:
-            pass
-    if cm_field_id is None:
-        for sf in defn.GetSchedulableFields():
-            try:
-                if sf.ParameterId == comments_pid:
-                    cm_field_id = defn.AddField(sf).FieldId
-                    break
-            except:
-                pass
-
-    # ensure Reference Level field exists and get FieldId (by display name for robustness)
-    ref_field_id = None
-    for i in range(defn.GetFieldCount()):
-        try:
-            f = defn.GetField(i)
-            if hasattr(f, "GetName") and f.GetName() == "Reference Level":
-                ref_field_id = f.FieldId
-                break
-            if hasattr(f, "GetSchedulableField"):
-                sf = f.GetSchedulableField()
-                if (
-                    sf
-                    and hasattr(sf, "GetName")
-                    and sf.GetName(vs) == "Reference Level"
-                ):
-                    ref_field_id = f.FieldId
-                    break
-        except:
-            pass
-    if ref_field_id is None:
-        for sf in defn.GetSchedulableFields():
-            try:
-                if hasattr(sf, "GetName") and sf.GetName(vs) == "Reference Level":
-                    ref_field_id = defn.AddField(sf).FieldId
-                    break
-            except:
-                pass
-
-    # wipe any existing filters on those fields, then add ours
-    if cm_field_id is not None:
-        for i in reversed(range(defn.GetFilterCount())):
-            try:
-                f = defn.GetFilter(i)
-                if f.FieldId == cm_field_id:
-                    defn.RemoveFilter(i)
-            except:
-                pass
-        defn.AddFilter(
-            ScheduleFilter(cm_field_id, ScheduleFilterType.Contains, sheet_code)
-        )
-
-    if ref_field_id is not None and level_name:
-        for i in reversed(range(defn.GetFilterCount())):
-            try:
-                f = defn.GetFilter(i)
-                if f.FieldId == ref_field_id:
-                    defn.RemoveFilter(i)
-            except:
-                pass
-        defn.AddFilter(
-            ScheduleFilter(ref_field_id, ScheduleFilterType.Equal, level_name)
-        )
-
-    # place schedule on sheet
-    uMin, uMax = sheet.Outline.Min.U, sheet.Outline.Max.U
-    vMin, vMax = sheet.Outline.Min.V, sheet.Outline.Max.V
-    w, h = (uMax - uMin), (vMax - vMin)
-    x = uMin + 0.05 * w
-    y = vMin + 0.70 * h
-    ScheduleSheetInstance.Create(doc, sheet.Id, vs.Id, XYZ(x, y, 0))
-
-    t.Commit()
-
-else:
-    # fallback minimal schedule (still filtered by code + level if we can)
-    cat_id = Category.GetCategory(doc, BuiltInCategory.OST_PipeCurves).Id
-    vs = ViewSchedule.CreateSchedule(doc, cat_id)
-    vs.Name = "Pipe Schedule {}".format(sheet_code)
-    defn = vs.Definition
-
-    # Comments
-    for sf in defn.GetSchedulableFields():
-        if sf.ParameterId == ElementId(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS):
-            cmf = defn.AddField(sf)
-            defn.AddFilter(
-                ScheduleFilter(cmf.FieldId, ScheduleFilterType.Contains, sheet_code)
-            )
-            break
-    # Reference Level (by name)
-    for sf in defn.GetSchedulableFields():
-        try:
-            if hasattr(sf, "GetName") and sf.GetName(vs) == "Reference Level":
-                rf = defn.AddField(sf)
-                if level_name:
-                    defn.AddFilter(
-                        ScheduleFilter(rf.FieldId, ScheduleFilterType.Equal, level_name)
-                    )
-                break
-        except:
-            pass
-
-    ScheduleSheetInstance.Create(
-        doc, sheet.Id, vs.Id, XYZ(tb_center.X - 0.35, tb_center.Y - 0.35, 0)
+    # center-ish placement
+    if not Viewport.CanAddViewToSheet(doc, sheet.Id, new_view.Id):
+        raise Exception("Plan view cannot be placed on this sheet.")
+    center = XYZ(
+        (sheet.Outline.Min.U + sheet.Outline.Max.U) / 2.0,
+        (sheet.Outline.Min.V + sheet.Outline.Max.V) / 2.0,
+        0,
     )
-# ---------- finally commit the sheet transaction ----------
-t3.Commit()
+    Viewport.Create(doc, sheet.Id, new_view.Id, center)
+
+    # schedules & 3D intentionally skipped in safe-mode
+    t3.Commit()
+
+MessageBox.Show(
+    "Prefab sheet '{}' created and plan placed.".format(sheet.SheetNumber), "Done"
+)
