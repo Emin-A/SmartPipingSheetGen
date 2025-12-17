@@ -1,1 +1,1 @@
-# Geberit
+# SmartSanitary
